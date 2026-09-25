@@ -2493,7 +2493,22 @@ class BacktestingBroker(Broker):
                 elif data_source_name == "YAHOO":
                     # Yahoo daily bars are stamped at the close (16:00). A one-day backstep keeps fills on
                     # the previous session so we never peek at the in-progress bar.
-                    timeshift = timedelta(days=-1)
+                    #
+                    # IMPORTANT: this -1 day offset is only correct for DAY-granularity fills.
+                    # `YahooData._get_filtered_end_index()` computes `end_filter -= timeshift`, so a
+                    # *negative* timeshift shifts the search window *forward* in time. For day bars an
+                    # earlier same-function backstep already applied cancels this out correctly. But for
+                    # intraday (minute) fills there is no such backstep, so passing -1 day here shifts the
+                    # lookup a full day *ahead* of the current sim time. Since intraday Yahoo data is only
+                    # cached one trading day at a time, `searchsorted` then clamps to the last bar in that
+                    # cached day (e.g. ~15:59), causing every fill that day to price off that single frozen
+                    # end-of-day bar regardless of the order's actual time. Only use the day-level backstep
+                    # when we're actually filling against day bars; otherwise use the same 1-minute
+                    # backstep as the other intraday-capable sources.
+                    if str(order_fill_timestep) == "day":
+                        timeshift = timedelta(days=-1)
+                    else:
+                        timeshift = timedelta(minutes=-1)
                 elif data_source_name == "ALPACA":
                     # Alpaca minute bars line up with our clock already; no offset needed.
                     timeshift = None
