@@ -232,6 +232,10 @@ DataSource (ABC)
 2. `YahooData` uses `YahooHelper` to fetch data via `yfinance` library
 3. Data is **already split-adjusted** by Yahoo
 4. No additional split processing needed
+5. One-minute downloads request the latest 29 calendar days in windows of at
+   most seven days, matching Yahoo's per-request restriction. Requests are
+   paced, each failed window is retried in place, and a non-contiguous or
+   schema-inconsistent response is rejected rather than returned as complete.
 
 **Key Function:** `YahooHelper.get_historical_prices()`
 

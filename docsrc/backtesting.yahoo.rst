@@ -10,6 +10,13 @@ Free Daily Stock Backtesting with Yahoo and LumiBot
 
 Yahoo backtesting is so named because we get data for the backtesting from the Yahoo Finance website. The user is not required to supply data. Any stock information that is available in the Yahoo Finance API should be available for backtesting. The Yahoo backtester is only for stock data (including ETFs). Additionally, you cannot use the Yahoo backtester for intra-day trading, it is for daily trading only. For other securities, use the Polygon or Pandas backtesters.
 
+LumiBot's Yahoo helper can also retrieve approximately the latest 29 calendar
+days of 1-minute data for internal consumers. Yahoo limits each 1-minute request
+to seven days, so LumiBot downloads consecutive windows and combines the real
+bars returned by Yahoo. The retention window is controlled by Yahoo and is not
+a guarantee of complete intraday history. This helper behavior does not enable
+intraday Yahoo backtests. No missing bars are synthesized.
+
 For a complete AI stock example, see :doc:`the bull/bear large-cap team
 <agents_example_bull_bear_large_cap_stocks>`. Yahoo daily bars cannot supply the
 09:30 to 09:45 evidence required by the :doc:`opening range breakout

@@ -87,6 +87,10 @@ Deploy marker: `3abbf8fcbd64` (original 4.5.92 marker)
   entry yet, so reasoning is accepted and tool calls with reasoning use the Responses API.
 
 ### Fixed
+- Yahoo 1-minute downloads now combine Yahoo-safe seven-day requests to expose
+  up to the latest 29 calendar days of retained minute bars instead of only
+  seven days. Missing windows remain missing and failed requests use the
+  existing bounded retry path.
 - `lumibot version` printed "unknown" from a source checkout or CI, where no installed package
   metadata exists. It now reports `lumibot.__version__` (setup.py in a checkout, then installed
   metadata), the same value the startup log prints.

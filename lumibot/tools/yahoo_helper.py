@@ -19,6 +19,10 @@ INFO_DATA = "info"
 INVALID_SYMBOLS = set()
 
 
+class YahooMinuteChunkDownloadError(RuntimeError):
+    """Raised when a Yahoo 1-minute history window cannot be downloaded."""
+
+
 class _YahooData:
     def __init__(self, symbol, type, data):
         self.symbol = symbol
@@ -226,6 +230,66 @@ class YahooHelper:
         return df["Close"].iloc[-1]
 
     @staticmethod
+    def _download_1m_chunked(ticker, total_days=29, chunk_days=7, max_retries=3):
+        """Download Yahoo 1-minute history in windows accepted by Yahoo."""
+        if total_days <= 0 or chunk_days <= 0 or max_retries <= 0:
+            raise ValueError("total_days, chunk_days, and max_retries must be positive")
+
+        now = get_lumibot_datetime().replace(second=0, microsecond=0)
+        earliest = now - timedelta(days=total_days)
+        chunks = []
+        expected_columns = None
+        reached_empty_history = False
+        request_count = 0
+        window_end = now
+
+        while window_end > earliest:
+            window_start = max(window_end - timedelta(days=chunk_days), earliest)
+            part = None
+            for attempt in range(1, max_retries + 1):
+                if request_count:
+                    proxy = YahooHelper.sleep_and_get_proxy()
+                    if proxy:
+                        yf.set_config(proxy=proxy)
+                request_count += 1
+                try:
+                    part = ticker.history(
+                        interval="1m",
+                        start=window_start,
+                        end=window_end,
+                        auto_adjust=False,
+                    )
+                    break
+                except Exception as exc:
+                    if attempt == max_retries:
+                        raise YahooMinuteChunkDownloadError(
+                            f"Yahoo 1-minute window {window_start} to {window_end} "
+                            f"failed after {max_retries} attempts"
+                        ) from exc
+
+            if part is None or part.empty:
+                reached_empty_history = True
+            else:
+                if reached_empty_history:
+                    raise YahooMinuteChunkDownloadError(
+                        "Yahoo returned a gap between populated 1-minute history windows"
+                    )
+                if expected_columns is None:
+                    expected_columns = part.columns
+                elif set(part.columns) != set(expected_columns):
+                    raise YahooMinuteChunkDownloadError(
+                        "Yahoo returned inconsistent columns across 1-minute history windows"
+                    )
+                chunks.append(part.reindex(columns=expected_columns))
+            window_end = window_start
+
+        if not chunks:
+            return None
+
+        df = pd.concat(chunks)
+        return df[~df.index.duplicated(keep="first")].sort_index()
+
+    @staticmethod
     def download_symbol_data(symbol, interval="1d"):
         """
         Attempts to download historical data from yfinance for the specified symbol and interval.
@@ -252,11 +316,7 @@ class YahooHelper:
                 if proxy:
                     yf.set_config(proxy=proxy)
                 if interval == "1m":
-                    df = ticker.history(
-                        interval=interval,
-                        start=get_lumibot_datetime() - timedelta(days=7),
-                        auto_adjust=False
-                    )
+                    df = YahooHelper._download_1m_chunked(ticker)
                 elif interval == "15m":
                     df = ticker.history(
                         interval=interval,
@@ -269,6 +329,9 @@ class YahooHelper:
                         period="max",
                         auto_adjust=False
                     )
+            except YahooMinuteChunkDownloadError as e:
+                logger.warning(f"{symbol}: {e}")
+                return None
             except Exception as e:
                 logger.debug(f"{symbol}: Exception from ticker.history(): {e}")
                 if attempt < max_retries:
@@ -277,8 +340,10 @@ class YahooHelper:
                     sleep_sec *= 2
                     continue
                 else:
-                    logger.debug(f"{symbol}: All {max_retries} attempts failed. Marking invalid.")
-                    INVALID_SYMBOLS.add(symbol)
+                    logger.warning(
+                        f"{symbol}: All {max_retries} download attempts failed; "
+                        "the symbol was not marked invalid because the failure may be transient."
+                    )
                     return None
 
             if df is None or df.empty:
