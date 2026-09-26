@@ -4,6 +4,11 @@ Interactive Brokers Legacy
 .. note::
     This method has been deprecated. Please use the other Interactive Brokers tutorial.
 
+Legacy socket balance initialization accepts both ordinary Interactive Brokers
+account-summary tags and the ``$LEDGER-`` prefixed tags returned by some
+``$LEDGER`` account-summary requests. LumiBot still selects the ``BASE``
+currency rows for cash and net liquidation values.
+
 Once installed, navigate in Trader Workstation to ``File -> Global Configuration -> API -> Settings`` The key settings required to trade using Lumibot are:
 
 #. Enable ActiveX and Socket Clients
