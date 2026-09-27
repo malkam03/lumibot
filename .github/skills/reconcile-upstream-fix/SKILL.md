@@ -24,6 +24,7 @@ For every independent fix:
 - identify its root cause and user-visible behavior;
 - cite matching upstream issues, PRs, commits, or dependency reports;
 - compare the actual implementations and tests;
+- maintain a reconciliation table as evidence is gathered, not only at the end;
 - retain provenance when reusing upstream work;
 - validate the final code;
 - run a meaningful rubber-duck review before committing novel work;
@@ -139,6 +140,18 @@ Do not call a new capability a repository bug when the existing API never
 promised it.
 
 ## 5. Classify and choose the integration strategy
+
+Keep a working reconciliation table and update it whenever evidence changes the
+classification or upstream plan. Use this shape so it can be copied directly
+into handoffs, release notes, or the final report:
+
+| Commit | Fix | Classification | Upstream evidence | Local action | Upstream plan |
+|---|---|---|---|---|---|
+
+If the user asks for a persistent record, write the table to the repository's
+normal docs or handoff location and keep it current through the rest of the
+workflow. Otherwise, keep it in a session artifact and include the final version
+in the response.
 
 ### Exact open upstream PR
 
