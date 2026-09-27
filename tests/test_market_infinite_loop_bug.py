@@ -19,6 +19,7 @@ from unittest.mock import patch
 from datetime import datetime, timedelta
 
 import pandas as pd
+import pytest
 
 from lumibot.credentials import DATABENTO_CONFIG
 from lumibot.strategies import Strategy
@@ -373,3 +374,76 @@ def test_broker_timeshift_guard():
 
     assert captured, "BacktestingBroker did not request historical data"
     assert captured[0] == timedelta(minutes=-2)
+
+
+@pytest.mark.parametrize(
+    ("data_timestep", "expected_timeshift"),
+    [
+        ("minute", timedelta(minutes=-1)),
+        ("day", timedelta(days=-1)),
+    ],
+)
+def test_yahoo_fill_timeshift_matches_fill_granularity(data_timestep, expected_timeshift):
+    captured = []
+
+    class StubDataSource:
+        SOURCE = "YAHOO"
+        IS_BACKTESTING_DATA_SOURCE = True
+
+        def __init__(self):
+            self._datetime = datetime(2025, 1, 2, 9, 35)
+            self._timestep = data_timestep
+
+        def get_historical_prices(self, asset, length, quote=None, timeshift=None, **kwargs):
+            captured.append(timeshift)
+            index = pd.DatetimeIndex([self._datetime])
+            frame = pd.DataFrame(
+                {
+                    "open": [200.0],
+                    "high": [201.0],
+                    "low": [199.5],
+                    "close": [200.5],
+                    "volume": [1500],
+                },
+                index=index,
+            )
+            return Bars(frame, self.SOURCE, asset, raw=frame)
+
+        def get_datetime(self):
+            return self._datetime
+
+    broker = BacktestingBroker(data_source=StubDataSource())
+    broker._datetime = broker.data_source.get_datetime()
+
+    order = Order(
+        strategy="stub",
+        asset=Asset("AAPL", asset_type=Asset.AssetType.STOCK),
+        quantity=1,
+        side=Order.OrderSide.BUY,
+    )
+    order.order_type = Order.OrderType.MARKET
+    order.quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
+    broker._new_orders.append(order)
+
+    class StubStrategy:
+        name = "stub"
+        buy_trading_fees = []
+        sell_trading_fees = []
+        timestep = data_timestep
+        bars_lookback = 1
+
+        def __init__(self, broker):
+            self.broker = broker
+            self.cash = 100000.0
+            self.quote_asset = Asset("USD", asset_type=Asset.AssetType.FOREX)
+
+        def log_message(self, *args, **kwargs):
+            return None
+
+        def _set_cash_position(self, value):
+            self.cash = value
+
+    broker.process_pending_orders(strategy=StubStrategy(broker))
+
+    assert captured, "BacktestingBroker did not request Yahoo historical data"
+    assert captured[0] == expected_timeshift
