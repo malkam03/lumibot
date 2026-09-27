@@ -87,6 +87,10 @@ Deploy marker: `3abbf8fcbd64` (original 4.5.92 marker)
   entry yet, so reasoning is accepted and tool calls with reasoning use the Responses API.
 
 ### Fixed
+- Legacy Interactive Brokers socket balances now accept both ordinary account
+  summary tags and `$LEDGER-` prefixed tags returned by `$LEDGER` requests, so
+  Gateway installations that prefix `BASE` rows initialize cash and portfolio
+  values instead of raising `IndexError`.
 - Yahoo 1-minute downloads now combine Yahoo-safe seven-day requests to expose
   up to the latest 29 calendar days of retained minute bars instead of only
   seven days. Missing windows remain missing and failed requests use the

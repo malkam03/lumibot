@@ -461,11 +461,50 @@ class InteractiveBrokers(Broker):
         if summary is None:
             return None
 
-        total_cash_value = [float(c["Value"]) for c in summary if c["Tag"] == "TotalCashBalance" and c["Currency"] == 'BASE'][0]
-        gross_position_value = [float(c["Value"]) for c in summary if c["Tag"] == "NetLiquidationByCurrency" and c["Currency"] == 'BASE'][0]
-        net_liquidation_value = [float(c["Value"]) for c in summary if c["Tag"] == "NetLiquidationByCurrency" and c["Currency"] == 'BASE'][0]
+        total_cash_value = self._get_account_summary_value(summary, "TotalCashBalance")
+        gross_position_value = self._get_account_summary_value(summary, "NetLiquidationByCurrency")
+        net_liquidation_value = self._get_account_summary_value(summary, "NetLiquidationByCurrency")
 
         return (total_cash_value, gross_position_value, net_liquidation_value)
+
+    @staticmethod
+    def _normalize_account_summary_tag(tag):
+        if not isinstance(tag, str):
+            return tag
+        if tag.startswith("$LEDGER-"):
+            return tag[len("$LEDGER-"):]
+        if tag.startswith("$LEDGER:"):
+            _, _, normalized_tag = tag.partition("-")
+            if normalized_tag:
+                return normalized_tag
+        return tag
+
+    @classmethod
+    def _get_account_summary_value(cls, summary, tag, currency="BASE"):
+        for row in summary:
+            if row.get("Currency") != currency:
+                continue
+            if cls._normalize_account_summary_tag(row.get("Tag")) != tag:
+                continue
+            try:
+                return float(row["Value"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Interactive Brokers account summary tag {tag!r} for currency {currency!r} "
+                    "did not contain a numeric value."
+                ) from None
+
+        available_tags = sorted(
+            {
+                row.get("Tag")
+                for row in summary
+                if row.get("Currency") == currency and row.get("Tag")
+            }
+        )
+        raise ValueError(
+            f"Interactive Brokers account summary is missing tag {tag!r} for currency {currency!r}. "
+            f"Available tags for that currency: {available_tags}"
+        )
 
     def get_contract_details(self, asset):
         # Used for Interactive Brokers. Convert an asset into a IB Contract.
