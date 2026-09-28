@@ -91,7 +91,10 @@ class InteractiveBrokersTWSBacktesting(PandasData):
         )
 
         self.MAX_STORAGE_BYTES = max_memory
-        self.ibkr_config = config or IBKRTWSConfig.from_env(
+        # Strategy.run_backtest() forwards its generic config dict to each data
+        # source. Only accept this source's typed config; otherwise use its own
+        # explicit arguments and environment rather than treating a dict as IB config.
+        self.ibkr_config = config if isinstance(config, IBKRTWSConfig) else IBKRTWSConfig.from_env(
             host=host,
             port=port,
             client_id=client_id,

@@ -272,11 +272,30 @@ def test_parse_bars_empty_input_returns_empty_frame():
     assert list(df.columns) == ["open", "high", "low", "close", "volume"]
 
 
-def test_stock_trades_volume_multiplier_default():
+def test_stock_trades_volume_multiplier_preserves_api_units_by_default():
     cfg = helper.IBKRTWSConfig()
-    assert cfg.effective_volume_multiplier(Asset("SPY")) == 100.0
-    assert cfg.replace(what_to_show="MIDPOINT").effective_volume_multiplier(Asset("SPY")) == 1.0
+    assert cfg.effective_volume_multiplier(Asset("SPY")) == 1.0
     assert cfg.replace(volume_multiplier=1.0).effective_volume_multiplier(Asset("SPY")) == 1.0
+    assert cfg.replace(volume_multiplier=100.0).effective_volume_multiplier(Asset("SPY")) == 100.0
+    bar = make_minute_bars(dt.date(2024, 1, 3), 1)
+    assert helper.parse_bars(bar, "minute")["volume"].iloc[0] == 10.0
+
+
+@pytest.mark.parametrize("timespan", ["minute", "day"])
+def test_in_progress_session_is_always_missing_even_with_sufficient_data(timespan):
+    session_date = dt.date(2024, 1, 3)
+    start = end = dt.datetime.combine(session_date, dt.time.min)
+    sessions = helper.get_trading_sessions(start, end)
+    if timespan == "minute":
+        bars = make_minute_bars(session_date, 360)
+    else:
+        bars = [FakeBar("20240103", 100, 101, 99, 100, 10)]
+    df = helper.parse_bars(bars, timespan)
+
+    before_close = EASTERN.localize(dt.datetime(2024, 1, 3, 15, 45))
+    after_close = EASTERN.localize(dt.datetime(2024, 1, 3, 16, 1))
+    assert helper.compute_missing_sessions(df, sessions, timespan, now=before_close) == [session_date]
+    assert helper.compute_missing_sessions(df, sessions, timespan, now=after_close) == []
 
 
 # --------------------------------------------------------------------------------------
@@ -658,21 +677,33 @@ def test_only_missing_sessions_are_requested(cache_dir, config):
 def test_day_timespan_end_to_end(cache_dir, config):
     asset = Asset("SPY")
     bars = [
-        FakeBar("20240103", 1.0, 2.0, 0.5, 1.5, 10),
-        FakeBar("20240104", 1.5, 2.5, 1.0, 2.0, 12),
+        FakeBar("20241129", 1.0, 2.0, 0.5, 1.5, 10),
+        FakeBar("20241202", 1.5, 2.5, 1.0, 2.0, 12),
     ]
     client = FakeClient(default=bars)
     df = _run(
         asset,
-        dt.datetime(2024, 1, 3),
-        dt.datetime(2024, 1, 4),
+        dt.datetime(2024, 12, 2),
+        dt.datetime(2024, 12, 2),
         client=client,
         config=config,
         timespan="day",
     )
-    assert len(df) == 2
-    assert [ts.tz_convert(EASTERN).hour for ts in df.index] == [16, 16]
+    assert len(df) == 1
+    assert [ts.tz_convert(EASTERN).hour for ts in df.index] == [16]
     assert client.requests[0]["bar_size"] == "1 day"
+    cache_file = helper.build_cache_filename(
+        asset,
+        "day",
+        None,
+        what_to_show=config.what_to_show,
+        use_rth=config.use_rth,
+        exchange=config.exchange,
+        currency=config.currency,
+    )
+    cached = helper.load_cache(cache_file)
+    assert cached is not None
+    assert {ts.tz_convert(EASTERN).date() for ts in cached.index} == {dt.date(2024, 12, 2)}
 
 
 def test_force_cache_update_redownloads(cache_dir, config):
@@ -693,6 +724,41 @@ def test_force_cache_update_redownloads(cache_dir, config):
         now=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
     )
     assert second.request_count == 1
+
+
+def test_force_cache_update_replaces_stale_rows_even_when_response_is_empty(cache_dir, config):
+    asset = Asset("SPY")
+    start = end = dt.datetime(2024, 1, 3)
+    initial = FakeClient(default=make_minute_bars(dt.date(2024, 1, 3), 390))
+    _run(asset, start, end, client=initial, config=config)
+
+    refreshed = FakeClient(default=[])
+    result = helper.get_price_data_from_ibkr_tws(
+        asset,
+        start,
+        end,
+        timespan="minute",
+        config=config,
+        client=refreshed,
+        force_cache_update=True,
+        show_progress=False,
+        now=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
+    )
+    assert result.empty
+    assert refreshed.request_count == 1
+    cache_file = helper.build_cache_filename(
+        asset,
+        "minute",
+        None,
+        what_to_show=config.what_to_show,
+        use_rth=config.use_rth,
+        exchange=config.exchange,
+        currency=config.currency,
+    )
+    cached = helper.load_cache(cache_file)
+    assert cached is not None
+    assert helper._real_rows(cached).empty
+    assert helper._missing_mask(cached).any()
 
 
 def test_returned_frame_is_filtered_to_the_requested_range(cache_dir, config):

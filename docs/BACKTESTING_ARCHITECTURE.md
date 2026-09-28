@@ -605,7 +605,8 @@ dependency.
   `endDateTime` and walks *backwards*, and a response capped at ~8190 bars silently loses its
   **oldest** bars. Polygon's `get_missing_dates()` marks a date done if any row exists; that
   rule would poison this cache. `compute_missing_sessions()` instead requires >= 90% of a
-  session's expected RTH minutes before it counts as covered.
+  completed session's expected RTH minutes before it counts as covered; in-progress sessions
+  remain retryable even if a provisional response contains enough bars.
 - **Only authoritative chunks may write "no data" placeholders**, and a chunk that returned
   usable, non-zero OHLC bars is authoritative only for sessions *newer* than its oldest such
   bar (`ChunkResult.authoritative_sessions()`). Zero padding is not evidence of coverage.
@@ -635,7 +636,10 @@ dependency.
   hint and so use minute bars; cadence inference (as ThetaData does) is a known follow-up.
 - Minute chunks are 14 calendar days, not "1 M": `"1 M"` returns exactly 8190 bars = 21 sessions
   x 390 RTH minutes, i.e. right at the cap, so a 22-session month truncates.
-- Historical stock TRADES volume arrives in round lots, so a x100 multiplier is applied.
+- Volume is preserved in the units reported by the configured TWS/API by default. Do not assume
+  round lots: IB can report either shares or round lots. Callers can set `volume_multiplier`
+  explicitly when they know the gateway's configured units. Forced cache rebuilds replace old
+  rows under the cache lock, including when the refreshed response contains no real bars.
 
 **Key Function:** `get_price_data_from_ibkr_tws()`
 

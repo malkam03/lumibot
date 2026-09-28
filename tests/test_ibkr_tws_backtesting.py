@@ -280,6 +280,21 @@ def test_environment_is_used_when_no_kwargs(monkeypatch):
         source.close()
 
 
+def test_generic_backtest_config_does_not_replace_tws_config():
+    source = InteractiveBrokersTWSBacktesting(
+        datetime_start=START,
+        datetime_end=END,
+        config={"generic_backtest_setting": True},
+        port=4001,
+        client=FakeClient(),
+    )
+    try:
+        assert isinstance(source.ibkr_config, helper.IBKRTWSConfig)
+        assert source.ibkr_config.port == 4001
+    finally:
+        source.close()
+
+
 def test_extending_cached_backtest_end_fetches_new_tail(cache_dir):
     asset = Asset("SPY")
     config = helper.IBKRTWSConfig(volume_multiplier=1.0)

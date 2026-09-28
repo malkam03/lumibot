@@ -81,9 +81,6 @@ MIN_MINUTE_COVERAGE_RATIO = 0.90
 DEFAULT_MINUTE_CHUNK_DAYS = 14
 DEFAULT_DAY_CHUNK_DAYS = 365
 
-#: TWS reports historical stock TRADES volume in round lots of 100 shares.
-STOCK_TRADES_VOLUME_MULTIPLIER = 100.0
-
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 4002  # IB Gateway paper. 4001 = GW live, 7497 = TWS paper, 7496 = TWS live.
 DEFAULT_CLIENT_ID = 77  # Well above the live strategy client ids (1-11).
@@ -256,14 +253,9 @@ class IBKRTWSConfig:
         return _replace(self, **changes)
 
     def effective_volume_multiplier(self, asset: Asset) -> float:
-        """Volume scaling applied to downloaded bars.
-
-        TWS reports historical stock TRADES volume in round lots (100 shares).
-        """
+        """Return an explicit volume override, otherwise preserve IB API units."""
         if self.volume_multiplier is not None:
             return float(self.volume_multiplier)
-        if _asset_type_str(asset) == "stock" and self.what_to_show.upper() == "TRADES":
-            return STOCK_TRADES_VOLUME_MULTIPLIER
         return 1.0
 
 
@@ -587,6 +579,7 @@ def update_cache(
     *,
     session_closes: Optional[Dict[date, pd.Timestamp]] = None,
     meta: Optional[dict] = None,
+    replace_existing: bool = False,
 ) -> pd.DataFrame:
     """Merge placeholder rows for authoritatively-empty sessions and persist.
 
@@ -619,16 +612,24 @@ def update_cache(
         df_all = pd.concat([df_all, placeholder_df]).sort_index()
         df_all = df_all[~df_all.index.duplicated(keep="first")]
 
-    if df_all.empty:
+    if df_all.empty and not replace_existing:
         return df_all
 
     lock = _cache_lock_for(cache_file)
     with lock:
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with _interprocess_cache_lock(cache_file):
+            if replace_existing and df_all.empty:
+                cache_file.unlink(missing_ok=True)
+                _meta_path(cache_file).unlink(missing_ok=True)
+                return df_all
             # Re-read inside the lock: another writer may have added rows since this
             # caller loaded the cache, and a blind overwrite would drop them.
-            on_disk = load_cache(cache_file) if (meta is None or _meta_matches(cache_file, meta)) else None
+            on_disk = (
+                load_cache(cache_file)
+                if not replace_existing and (meta is None or _meta_matches(cache_file, meta))
+                else None
+            )
             df_all = _combine_cached(on_disk, df_all)
             if df_all.empty:
                 return df_all
@@ -700,8 +701,8 @@ def compute_missing_sessions(
     A session is covered when it has an authoritative placeholder, or enough real
     bars. For minute data "enough" means at least
     ``min_minute_coverage_ratio`` of the session's expected RTH minutes, which is
-    what catches IB responses silently truncated at the bar cap. Sessions that
-    have not finished yet are always reported as missing but are never
+    what catches IB responses silently truncated at the bar cap. In-progress
+    sessions remain missing regardless of current coverage and are never
     placeholdered (see :func:`get_price_data_from_ibkr_tws`).
     """
     if sessions is None or sessions.empty:
@@ -741,6 +742,9 @@ def compute_missing_sessions(
 
     missing: List[date] = []
     for session_date, row in sessions.iterrows():
+        if not _session_is_closed(row["market_close"], session_date, now_utc):
+            missing.append(session_date)
+            continue
         if session_date in placeholders:
             continue
         have = int(counts.get(session_date, 0))
@@ -1760,6 +1764,15 @@ def get_price_data_from_ibkr_tws(
                         session_closes=session_closes,
                         volume_multiplier=volume_multiplier,
                     )
+                    if timespan == "day" and not df_new.empty:
+                        # IB's duration slack may include a prior session. It is
+                        # outside this request and may lack its actual (possibly
+                        # early) close in session_closes, so do not cache it.
+                        requested_dates = set(sessions.index)
+                        returned_dates = df_new.index.tz_convert(_EASTERN).date
+                        df_new = df_new[
+                            [session_date in requested_dates for session_date in returned_dates]
+                        ]
                     df_all = _merge_frames(df_all, df_new)
                 authoritative_sessions.update(
                     result.authoritative_sessions(missing, earliest_returned)
@@ -1803,6 +1816,7 @@ def get_price_data_from_ibkr_tws(
         placeholders,
         session_closes=session_closes,
         meta=meta,
+        replace_existing=force_cache_update,
     )
 
     unresolved = [d for d in still_missing if d not in set(placeholders)]

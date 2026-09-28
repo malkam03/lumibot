@@ -181,6 +181,16 @@ so a daily backtest cannot see the current session's close while that session is
 still running. Explicit calls to ``get_last_price(..., timestep="day")`` select
 native day data even when minute and day datasets for the same asset are both loaded.
 
+Volume units
+------------
+
+Historical volume is kept in the units reported by the connected TWS/Gateway API.
+Interactive Brokers can report stock volume as either shares or round lots, depending
+on the API settings; LumiBot does not assume one format. If the gateway reports round
+lots and your strategy expects shares, set ``volume_multiplier=100`` when constructing
+``InteractiveBrokersTWSBacktesting``. The multiplier is explicit so a shares-configured
+gateway is never silently scaled by 100.
+
 Daily-cadence strategies
 ------------------------
 
@@ -202,7 +212,8 @@ Caching
   cache schema version.
 * Sessions that IB authoritatively reports as empty are stored as placeholder
   rows so they are never requested again.
-* Pass ``force_cache_update=True`` (or delete the parquet file) to rebuild.
+* Pass ``force_cache_update=True`` (or delete the parquet file) to rebuild. This replaces
+  the prior cached rows under a lock, even if the refresh returns no real bars.
 
 Known limitations
 -----------------

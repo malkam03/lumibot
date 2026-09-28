@@ -27,6 +27,12 @@
   `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True` class attribute, in addition to the existing
   class-name checks. `InteractiveBrokersTWSBacktesting` opts in.
 
+### Fixed
+- IBKR TWS backtests now ignore the generic strategy config object unless it is an
+  `IBKRTWSConfig`, preserve volumes in the units reported by TWS by default, retry sessions
+  still in progress, avoid caching daily bars outside the requested sessions, and truly replace
+  stale rows on forced cache refreshes. Cache lock protection is preserved during replacement.
+
 ## 4.6.0 - 2026-09-24
 
 4.6.0 is the first published release of this work. Tag `v4.5.92` was created but its release run stopped at the agent eval gate, so 4.5.92 was never published to PyPI. Everything planned for 4.5.92 ships here, renamed 4.6.0 because of the size of the AI agent changes.
