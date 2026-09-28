@@ -124,7 +124,7 @@ environment:
         InteractiveBrokersTWSBacktesting,
         datetime(2024, 1, 1),
         datetime(2024, 3, 1),
-        host="10.0.0.20",
+        host="<your-gateway-host>",
         port=4001,
         client_id=77,
         use_rth=True,
@@ -178,7 +178,8 @@ Daily bars are stamped at the session close
 IB returns daily bars dated at midnight. LumiBot re-stamps each daily bar to the
 actual NYSE close for that session (16:00 ET, or 13:00 ET on an early-close day)
 so a daily backtest cannot see the current session's close while that session is
-still running.
+still running. Explicit calls to ``get_last_price(..., timestep="day")`` select
+native day data even when minute and day datasets for the same asset are both loaded.
 
 Daily-cadence strategies
 ------------------------

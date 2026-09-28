@@ -607,9 +607,10 @@ dependency.
   rule would poison this cache. `compute_missing_sessions()` instead requires >= 90% of a
   session's expected RTH minutes before it counts as covered.
 - **Only authoritative chunks may write "no data" placeholders**, and a chunk that returned
-  bars is authoritative only for sessions *newer* than its oldest returned bar
-  (`ChunkResult.authoritative_sessions()`). Failures, timeouts, and truncation leave sessions
-  uncached and retryable. Errors 200/326/354 raise instead of caching emptiness.
+  usable, non-zero OHLC bars is authoritative only for sessions *newer* than its oldest such
+  bar (`ChunkResult.authoritative_sessions()`). Zero padding is not evidence of coverage.
+  Failures, timeouts, and truncation leave sessions uncached and retryable. Errors 200/326/354
+  raise instead of caching emptiness.
 - **Daily bars are re-stamped to the real session close** (16:00 ET, or the early close), and
   the class sets `PREFER_NATIVE_DAY_BARS_FOR_STOCK_INDEX = True`, so `timestep="day"` can never
   be satisfied by resampled minute data. Same lookahead rule as `ibkr_helper`.
@@ -617,8 +618,11 @@ dependency.
   `PandasData.get_last_price()` / `get_quote()` call `find_asset_in_data_store(asset, quote)`
   *without* a timestep, and the base method only builds timestep-bearing candidate keys when a
   timestep is given, so the class overrides `find_asset_in_data_store()` to fall back to
-  `minute` then `day` for untyped lookups. Without it every loaded dataset was unreachable and
-  `get_last_price()` returned `None` forever.
+  `minute` then `day` for untyped lookups. Explicit `get_last_price(..., timestep=...)` keeps
+  honoring the requested resolution. Without the fallback every loaded dataset was unreachable
+  and `get_last_price()` returned `None` forever. Cached in-memory data only skips refresh when
+  both the start and latest requested session are adequately covered, so extending the end date
+  fetches the new tail.
 - **`SOURCE` must stay `"PANDAS"`** (inherited, as Polygon/ThetaData/DataBento do).
   `BacktestingBroker.process_pending_orders()` only runs its OHLC fill model for
   `SOURCE == "PANDAS"` or a hard-coded provider name; a custom `SOURCE` leaves every order

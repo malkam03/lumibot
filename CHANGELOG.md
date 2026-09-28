@@ -19,6 +19,10 @@
   `INTERACTIVE_BROKERS_IP` / `INTERACTIVE_BROKERS_PORT`.
 - Documentation page `docsrc/backtesting.interactive_brokers_tws.rst` and an architecture
   section in `docs/BACKTESTING_ARCHITECTURE.md`.
+- Fixed IB Gateway/TWS data lookups so timestep-keyed datasets are reachable from
+  `get_last_price()` and `get_quote()`, and so an extended end date triggers a cache refresh.
+  Backtesting broker OHLC fills now use the inherited `PANDAS` source path. Added an opt-in
+  daily-cadence last-price capability flag, preserving explicit requested timestep selection.
 - Backtesting data sources can opt into the daily-cadence last-price shortcut with a
   `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True` class attribute, in addition to the existing
   class-name checks. `InteractiveBrokersTWSBacktesting` opts in.

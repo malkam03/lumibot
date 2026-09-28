@@ -3,6 +3,8 @@
 LumiBot is open source. Never put private, incriminating, account-specific, or
 machine-specific information in this file or any other tracked repo file.
 
+PII includes personal (non-public) names and contact details, postal addresses, government identifiers, dates of birth, and account/customer identifiers.
+
 - Do not include usernames, passwords, API keys, tokens, account emails,
   customer identifiers, broker credentials, paid vendor credentials, private
   hostnames, private URLs, cookies, local profile paths, or absolute personal
@@ -16,6 +18,14 @@ machine-specific information in this file or any other tracked repo file.
   in the private repo/docs/secret store, not in this public LumiBot checkout.
 - If sensitive data is found in tracked files, remove it immediately, scan for
   nearby leaks, and treat exposed credentials as needing rotation.
+- Before publishing a branch or pull request, inspect the complete proposed diff,
+  PR title/body, review comments/replies, and any attachments for PII, secrets, account-specific data, and
+  machine-specific details. Use a repository-appropriate scanner plus a manual
+  review; replace legitimate examples with safe placeholders and do not reproduce
+  discovered sensitive values in chat or review comments.
+- Show the reviewed code/diff and PII-review result to the requester and wait for explicit
+  approval before pushing commits or creating/updating a pull request. A request to
+  implement a change is not approval to publish it.
 
 # Express Authorization Required For LumiBot Changes
 

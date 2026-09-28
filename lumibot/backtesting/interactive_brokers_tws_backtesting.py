@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import traceback
 from collections import OrderedDict
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional, Union
+
+import pandas as pd
 
 from lumibot.data_sources import PandasData
 from lumibot.entities import Asset, Data
@@ -194,8 +197,31 @@ class InteractiveBrokersTWSBacktesting(PandasData):
                 asset_data = legacy
         if asset_data is not None and not asset_data.df.empty:
             data_start_datetime = asset_data.df.index[0]
-            if (data_start_datetime - start_datetime) < START_BUFFER:
-                return
+            requested_start = pd.Timestamp(start_datetime)
+            if requested_start.tzinfo is None:
+                requested_start = requested_start.tz_localize("America/New_York")
+            else:
+                requested_start = requested_start.tz_convert("America/New_York")
+            start_is_covered = data_start_datetime <= (
+                requested_start.tz_convert("UTC") + START_BUFFER
+            )
+            if start_is_covered:
+                # The helper's parquet cache may already contain more history than
+                # this in-memory Data object (for example, a later backtest extends
+                # its end date). Do not skip the helper unless every requested
+                # session is adequately covered; the helper will fetch any missing
+                # sessions while preserving cached history.
+                sessions = ibkr_tws_helper.get_trading_sessions(start_datetime, self.datetime_end)
+                if sessions.empty:
+                    return
+                missing_sessions = ibkr_tws_helper.compute_missing_sessions(
+                    asset_data.df,
+                    sessions,
+                    ts_unit,
+                    use_rth=self.ibkr_config.use_rth,
+                )
+                if not missing_sessions:
+                    return
 
         try:
             df = ibkr_tws_helper.get_price_data_from_ibkr_tws(
@@ -268,7 +294,29 @@ class InteractiveBrokersTWSBacktesting(PandasData):
         # Deliberately not swallowed: a download failure here would otherwise make the
         # backtest price off whatever stale data happens to be loaded.
         self._update_pandas_data(asset, quote, 1, timestep, self.get_datetime())
-        return super().get_last_price(asset=asset, quote=quote, exchange=exchange)
+        key = self.find_asset_in_data_store(asset, quote, timestep)
+        if key is None or key not in self._data_store:
+            return None
+
+        try:
+            data = self._data_store[key]
+            now = self.get_datetime()
+            price = data.get_last_price(now)
+            price = self._adjust_stale_daily_price_for_stock_split(data, price, now)
+            if price is None:
+                return None
+            numeric_price = float(price)
+            if not math.isfinite(numeric_price) or numeric_price <= 0:
+                logger.warning(
+                    "Ignoring invalid or non-positive price %s for %s; treating as missing data.",
+                    price,
+                    key,
+                )
+                return None
+            return price
+        except Exception as exc:
+            logger.info("Error getting last price for %s: %s", key, exc)
+            return None
 
     def get_chains(self, asset: Asset, quote: Asset = None, exchange: str = None):
         raise NotImplementedError(

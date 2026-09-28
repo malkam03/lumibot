@@ -15,7 +15,7 @@ import pytest
 import pytz
 
 from lumibot.backtesting import InteractiveBrokersTWSBacktesting
-from lumibot.entities import Asset
+from lumibot.entities import Asset, Data
 from lumibot.tools import ibkr_tws_helper as helper
 
 from tests.test_ibkr_tws_helper import FakeBar, FakeClient, make_minute_bars
@@ -268,14 +268,108 @@ def test_kwargs_override_environment(monkeypatch):
 
 
 def test_environment_is_used_when_no_kwargs(monkeypatch):
-    monkeypatch.setenv("INTERACTIVE_BROKERS_IP", "10.1.2.3")
+    monkeypatch.setenv("INTERACTIVE_BROKERS_IP", "127.0.0.1")
     monkeypatch.setenv("INTERACTIVE_BROKERS_PORT", "7496")
     source = InteractiveBrokersTWSBacktesting(
         datetime_start=START, datetime_end=END, client=FakeClient()
     )
     try:
-        assert source.ibkr_config.host == "10.1.2.3"
+        assert source.ibkr_config.host == "127.0.0.1"
         assert source.ibkr_config.port == 7496
+    finally:
+        source.close()
+
+
+def test_extending_cached_backtest_end_fetches_new_tail(cache_dir):
+    asset = Asset("SPY")
+    config = helper.IBKRTWSConfig(volume_multiplier=1.0)
+    bars = minute_bars_for_range(dt.date(2024, 1, 3), dt.date(2024, 1, 5))
+    client = FakeClient(default=bars)
+    source = InteractiveBrokersTWSBacktesting(
+        datetime_start=dt.datetime(2024, 1, 3),
+        datetime_end=dt.datetime(2024, 1, 4),
+        config=config,
+        client=client,
+    )
+    try:
+        source._update_pandas_data(asset, None, 1, "minute", dt.datetime(2024, 1, 3))
+        key = (asset, Asset("USD", "forex"), "minute")
+        assert key in source.pandas_data
+        original_last = source.pandas_data[key].df.index.max()
+
+        # Reuse the same source's in-memory data, like a later run extending the
+        # requested end date. A start-only cache check would return above and omit
+        # the newly requested final session.
+        source.datetime_end = dt.datetime(2024, 1, 5)
+        source._update_pandas_data(asset, None, 1, "minute", dt.datetime(2024, 1, 3))
+        extended = source.pandas_data[key].df
+        assert extended.index.max() > original_last
+        assert extended.index.max().tz_convert(EASTERN).date() == dt.date(2024, 1, 5)
+        assert client.request_count >= 2
+    finally:
+        source.close()
+
+
+def test_interior_cache_gap_is_fetched_when_boundaries_are_covered(cache_dir):
+    asset = Asset("SPY")
+    quote = Asset("USD", "forex")
+    missing_date = dt.date(2024, 1, 4)
+    cached_bars = [
+        bar
+        for session_date in helper.get_trading_sessions(
+            dt.datetime(2023, 12, 20), dt.datetime(2024, 1, 5)
+        ).index
+        if session_date != missing_date
+        for bar in make_minute_bars(session_date, 390)
+    ]
+    cached_df = helper.parse_bars(cached_bars, "minute")
+    client = FakeClient(
+        default=minute_bars_for_range(dt.date(2023, 12, 20), dt.date(2024, 1, 5))
+    )
+    source = build_source(client)
+    key = (asset, quote, "minute")
+    source.pandas_data[key] = Data(asset, cached_df, timestep="minute", quote=quote)
+
+    try:
+        initial_requests = client.request_count
+        source._update_pandas_data(asset, None, 1, "minute", START)
+
+        refreshed = source.pandas_data[key].df
+        eastern_dates = refreshed.index.tz_convert(EASTERN).date
+        assert client.request_count > initial_requests
+        assert (eastern_dates == missing_date).sum() == 390
+    finally:
+        source.close()
+
+
+def test_last_price_honors_requested_timestep_when_both_are_loaded(cache_dir):
+    class ResolutionClient(FakeClient):
+        def __init__(self):
+            super().__init__(default=[])
+            self.minute_bars = minute_bars_for_range(dt.date(2024, 1, 3), dt.date(2024, 1, 5))
+            self.day_bars = [
+                FakeBar(day.strftime("%Y%m%d"), 200, 201, 199, 200.5, 1000)
+                for day in helper.get_trading_sessions(START, END).index
+            ]
+
+        def request_historical_bars(self, contract, end_datetime, duration, bar_size, **kwargs):
+            super().request_historical_bars(contract, end_datetime, duration, bar_size, **kwargs)
+            return self.day_bars if "day" in bar_size else self.minute_bars
+
+    source = build_source(ResolutionClient())
+    asset = Asset("SPY")
+    try:
+        source._datetime = EASTERN.localize(dt.datetime(2024, 1, 4, 11, 0))
+        source._update_pandas_data(asset, None, 1, "minute", source.get_datetime())
+        source._update_pandas_data(asset, None, 1, "day", source.get_datetime())
+
+        minute_price = source.get_last_price(asset, timestep="minute")
+        day_price = source.get_last_price(asset, timestep="day")
+        assert minute_price != day_price
+        assert day_price == pytest.approx(200.5)
+        # get_quote has no timestep parameter, so it uses the documented default
+        # lookup order (minute before day) rather than the day-only last-price call.
+        assert source.get_quote(asset).price < day_price
     finally:
         source.close()
 

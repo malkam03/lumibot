@@ -321,6 +321,12 @@ def test_format_duration_uses_days_then_years():
     assert helper.format_duration(dt.date(2020, 1, 1), dt.date(2024, 1, 1)).endswith("Y")
 
 
+def test_maximum_calendar_chunk_stays_one_year_after_slack():
+    first = dt.date(2024, 1, 1)
+    last = first + dt.timedelta(days=364)
+    assert helper.format_duration(first, last) == "1 Y"
+
+
 def test_minute_chunk_default_stays_under_the_ib_bar_cap():
     """A "1 M" minute request returns exactly 8190 bars -- right at IB's cap."""
     max_sessions = helper.DEFAULT_MINUTE_CHUNK_DAYS * 5 / 7
@@ -902,13 +908,13 @@ def test_format_end_datetime_variants():
 
 
 def test_config_from_env(monkeypatch):
-    monkeypatch.setenv("INTERACTIVE_BROKERS_IP", "10.0.0.5")
+    monkeypatch.setenv("INTERACTIVE_BROKERS_IP", "127.0.0.1")
     monkeypatch.setenv("INTERACTIVE_BROKERS_PORT", "7497")
     monkeypatch.setenv("IBKR_BACKTEST_CLIENT_ID", "91")
     monkeypatch.setenv("IBKR_BACKTEST_USE_RTH", "false")
     monkeypatch.setenv("IBKR_BACKTEST_WHAT_TO_SHOW", "midpoint")
     cfg = helper.IBKRTWSConfig.from_env()
-    assert (cfg.host, cfg.port, cfg.client_id) == ("10.0.0.5", 7497, 91)
+    assert (cfg.host, cfg.port, cfg.client_id) == ("127.0.0.1", 7497, 91)
     assert cfg.use_rth is False
     assert cfg.what_to_show == "MIDPOINT"
 
@@ -936,6 +942,31 @@ def test_config_overrides_win_over_env(monkeypatch):
 # --------------------------------------------------------------------------------------
 # Cache-poisoning regressions (rubber-duck findings)
 # --------------------------------------------------------------------------------------
+
+
+def test_zero_padding_does_not_claim_older_sessions_as_authoritative():
+    sessions = [dt.date(2024, 1, 3), dt.date(2024, 1, 4), dt.date(2024, 1, 5)]
+    zero = [
+        FakeBar(int(EASTERN.localize(dt.datetime.combine(day, dt.time(9, 30))).timestamp()), 0, 0, 0, 0, 0)
+        for day in sessions[:2]
+    ]
+    real = make_minute_bars(sessions[1], 390)
+    earliest = helper._earliest_raw_session(zero + real, "minute")
+    assert earliest == sessions[1]
+    result = helper.ChunkResult(
+        helper.CHUNK_COMPLETE,
+        sessions[0],
+        sessions[2],
+        bars=zero + real,
+    )
+    assert result.authoritative_sessions(sessions, earliest) == {sessions[2]}
+
+
+def test_zero_only_raw_response_has_no_earliest_usable_session():
+    zero = make_minute_bars(dt.date(2024, 1, 3), 2)
+    for bar in zero:
+        bar.open = bar.high = bar.low = bar.close = 0
+    assert helper._earliest_raw_session(zero, "minute") is None
 
 
 def test_all_zero_response_is_retried_on_the_next_run(cache_dir, config):

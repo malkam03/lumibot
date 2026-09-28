@@ -788,11 +788,13 @@ def format_duration(first: date, last: date) -> str:
     """IB ``durationStr`` covering ``[first, last]`` inclusive."""
     days = (last - first).days + 1
     # +1 day of slack: IB counts back from endDateTime, and the end anchor sits at
-    # the session close rather than midnight.
+    # the session close rather than midnight. Remove that one slack day before
+    # converting to years so a maximum 365-calendar-day chunk stays at "1 Y".
     days += 1
     if days <= 365:
         return f"{days} D"
-    return f"{math.ceil(days / 365)} Y"
+    years = max(1, math.ceil((days - 1) / 365))
+    return f"{years} Y"
 
 
 # --------------------------------------------------------------------------------------
@@ -1493,16 +1495,21 @@ def _earliest_raw_session(
     timespan: str,
     session_closes: Optional[Dict[date, pd.Timestamp]] = None,
 ) -> Optional[date]:
-    """Eastern session date of the oldest bar in a raw IB response.
+    """Eastern session date of the oldest usable, non-zero OHLC bar in a response.
 
-    Derived from the *raw* response rather than the parsed frame: rows dropped by
-    :func:`parse_bars` (all-zero OHLC) still prove the response reached back that
-    far, and using the parsed frame instead would let a zero-only response look
-    like an authoritative "no data" answer.
+    Zero-padded rows are not evidence that IB returned real history for that
+    session. If a response contains only those rows, return ``None`` so the caller
+    cannot write permanent no-data placeholders based on the padding.
     """
     earliest: Optional[date] = None
     for bar in bars:
-        ts = parse_ib_datetime(getattr(bar, "date", None), timespan, session_closes)
+        try:
+            ohlc = tuple(float(_bar_value(bar, name)) for name in ("open", "high", "low", "close"))
+        except (TypeError, ValueError):
+            continue
+        if not all(math.isfinite(value) for value in ohlc) or all(value == 0 for value in ohlc):
+            continue
+        ts = parse_ib_datetime(_bar_value(bar, "date"), timespan, session_closes)
         if ts is None:
             continue
         session_date = ts.tz_convert(_EASTERN).date()
