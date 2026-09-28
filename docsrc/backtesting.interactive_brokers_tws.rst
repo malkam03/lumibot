@@ -180,6 +180,18 @@ actual NYSE close for that session (16:00 ET, or 13:00 ET on an early-close day)
 so a daily backtest cannot see the current session's close while that session is
 still running.
 
+Daily-cadence strategies
+------------------------
+
+When a strategy runs once a day (``sleeptime = "1D"``), ``self.get_last_price()``
+for stocks reads the latest native daily bar at or before the simulated time.
+Because daily bars are stamped at the session close, this never returns a close
+that has not happened yet.
+
+Portfolio valuation and order fills still use minute bars, so the first run of a
+daily backtest also downloads minute history for the traded symbols. That
+download is cached like any other, so later runs make no network calls.
+
 Caching
 -------
 

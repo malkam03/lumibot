@@ -613,7 +613,22 @@ dependency.
 - **Daily bars are re-stamped to the real session close** (16:00 ET, or the early close), and
   the class sets `PREFER_NATIVE_DAY_BARS_FOR_STOCK_INDEX = True`, so `timestep="day"` can never
   be satisfied by resampled minute data. Same lookahead rule as `ibkr_helper`.
-- **Datasets are keyed `(asset, quote, timestep)`** so minute and day data coexist.
+- **Datasets are keyed `(asset, quote, timestep)`** so minute and day data coexist. The inherited
+  `PandasData.get_last_price()` / `get_quote()` call `find_asset_in_data_store(asset, quote)`
+  *without* a timestep, and the base method only builds timestep-bearing candidate keys when a
+  timestep is given, so the class overrides `find_asset_in_data_store()` to fall back to
+  `minute` then `day` for untyped lookups. Without it every loaded dataset was unreachable and
+  `get_last_price()` returned `None` forever.
+- **`SOURCE` must stay `"PANDAS"`** (inherited, as Polygon/ThetaData/DataBento do).
+  `BacktestingBroker.process_pending_orders()` only runs its OHLC fill model for
+  `SOURCE == "PANDAS"` or a hard-coded provider name; a custom `SOURCE` leaves every order
+  pending forever with no error. `tests/test_ibkr_tws_strategy_backtest_e2e.py` runs a real
+  `Strategy.backtest()` and asserts an order fills, guarding both of these.
+- **Daily last-price shortcut is opt-in via `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True`**
+  (checked by `Strategy._supports_daily_last_price_optimization()`), because the class name
+  does not contain the `"ibkr"` substring the legacy check looks for. Safe because day bars are
+  close-stamped. Portfolio valuation and order fills still call the source without a cadence
+  hint and so use minute bars; cadence inference (as ThetaData does) is a known follow-up.
 - Minute chunks are 14 calendar days, not "1 M": `"1 M"` returns exactly 8190 bars = 21 sessions
   x 390 RTH minutes, i.e. right at the cap, so a 22-session month truncates.
 - Historical stock TRADES volume arrives in round lots, so a x100 multiplier is applied.

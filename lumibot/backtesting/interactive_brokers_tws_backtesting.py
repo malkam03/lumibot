@@ -45,11 +45,20 @@ class InteractiveBrokersTWSBacktesting(PandasData):
     ... )
     """
 
-    SOURCE = "InteractiveBrokersTWS"
+    # SOURCE is deliberately inherited from PandasData ("PANDAS"), as Polygon,
+    # ThetaData and DataBento do. BacktestingBroker only routes pending orders into
+    # its OHLC fill model when SOURCE == "PANDAS" (or a hard-coded provider name);
+    # a custom SOURCE here left every order pending forever and nothing ever filled.
     MIN_TIMESTEP = "minute"
     # IB day bars need native daily data: they are re-stamped at the session close
     # to avoid same-session lookahead, which minute->day resampling would undo.
     PREFER_NATIVE_DAY_BARS_FOR_STOCK_INDEX = True
+    # Daily-cadence strategies should price from native day bars instead of pulling
+    # years of minute bars through IB pacing. Safe because day bars are stamped at the
+    # session close, so the latest bar at or before sim time never leaks the future.
+    SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True
+    # Preference order when a caller does not name a timestep: the finest data wins.
+    _UNSPECIFIED_TIMESTEP_LOOKUP_ORDER = ("minute", "day")
 
     def __init__(
         self,
@@ -140,6 +149,23 @@ class InteractiveBrokersTWSBacktesting(PandasData):
 
     # -- data ------------------------------------------------------------------------
 
+    def find_asset_in_data_store(self, asset, quote=None, timestep=None):
+        """Resolve the canonical ``(asset, quote, timestep)`` keys this source writes.
+
+        Inherited ``PandasData.get_last_price()`` and ``get_quote()`` look up without
+        a timestep, and the base implementation only builds timestep-bearing
+        candidate keys when a timestep is given. Without this fallback every loaded
+        dataset is unreachable from those methods and no order can ever fill.
+        """
+        key = super().find_asset_in_data_store(asset, quote, timestep)
+        if key is not None or timestep is not None:
+            return key
+        for candidate_timestep in self._UNSPECIFIED_TIMESTEP_LOOKUP_ORDER:
+            key = super().find_asset_in_data_store(asset, quote, candidate_timestep)
+            if key is not None:
+                return key
+        return None
+
     def _update_pandas_data(self, asset, quote, length, timestep, start_dt=None):
         """Download (or reuse cached) bars and merge them into ``self.pandas_data``."""
         search_asset = asset
@@ -196,8 +222,10 @@ class InteractiveBrokersTWSBacktesting(PandasData):
         self.pandas_data[dataset_key] = data
         self.pandas_data.move_to_end(dataset_key)
         self._data_store = self.pandas_data
-        # A previously cached miss must not hide the dataset we just loaded.
-        self._find_asset_in_data_store_cache.pop((asset_separated, quote, timestep), None)
+        # A lookup resolved before this load (to a coarser dataset, or under another
+        # quote/timestep spelling) must not hide the dataset just loaded. Loads are
+        # rare relative to lookups, so clearing the whole cache is cheap.
+        self._find_asset_in_data_store_cache.clear()
         if self.MAX_STORAGE_BYTES:
             self._enforce_storage_limit(self.pandas_data)
 

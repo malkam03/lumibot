@@ -19,6 +19,9 @@
   `INTERACTIVE_BROKERS_IP` / `INTERACTIVE_BROKERS_PORT`.
 - Documentation page `docsrc/backtesting.interactive_brokers_tws.rst` and an architecture
   section in `docs/BACKTESTING_ARCHITECTURE.md`.
+- Backtesting data sources can opt into the daily-cadence last-price shortcut with a
+  `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True` class attribute, in addition to the existing
+  class-name checks. `InteractiveBrokersTWSBacktesting` opts in.
 
 ## 4.6.0 - 2026-09-24
 
