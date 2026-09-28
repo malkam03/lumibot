@@ -75,10 +75,10 @@ def test_class_is_exported_from_the_backtesting_package():
 
 
 @pytest.mark.parametrize(
-    "label", ["ibkr_tws", "interactive_brokers_tws", "ibkr_socket", "ibkr_gateway"]
+    "label", ["ibkr_tws", "interactive_brokers_tws"]
 )
 def test_backtesting_data_source_labels_resolve_to_the_tws_class(label):
-    """Every advertised BACKTESTING_DATA_SOURCE alias must map to the new class."""
+    """The supported BACKTESTING_DATA_SOURCE labels map to the new class."""
     from lumibot.strategies import _strategy
 
     source = Path(_strategy.__file__).read_text()

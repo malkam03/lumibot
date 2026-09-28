@@ -10,8 +10,8 @@
   `LUMIBOT_CACHE_FOLDER/ibkr_tws` so a repeated backtest makes zero network calls.
   Scope v1 is stocks/ETFs (`STK`/`SMART`/`USD`) at minute and day timesteps; other asset types
   raise `NotImplementedError`.
-- `BACKTESTING_DATA_SOURCE` accepts `ibkr_tws` (plus aliases `interactive_brokers_tws`,
-  `ibkr_socket`, `ibkr_gateway`). Plain `ibkr` still selects the existing REST source.
+- `BACKTESTING_DATA_SOURCE` accepts `ibkr_tws` and `interactive_brokers_tws`. Plain
+  `ibkr` still selects the existing REST source.
 - New environment variables `IBKR_BACKTEST_CLIENT_ID` (default 77),
   `IBKR_BACKTEST_WHAT_TO_SHOW`, `IBKR_BACKTEST_USE_RTH`, `IBKR_BACKTEST_TIMEOUT`, and
   `IBKR_BACKTEST_MAX_REQUESTS_PER_10MIN`, documented in

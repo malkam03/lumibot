@@ -112,9 +112,8 @@ You can also select the source without touching your code:
 
     export BACKTESTING_DATA_SOURCE=ibkr_tws
 
-The aliases ``interactive_brokers_tws``, ``ibkr_socket``, and ``ibkr_gateway``
-resolve to the same class. Plain ``ibkr`` still means the REST Data Downloader
-source, which is unchanged.
+The alias ``interactive_brokers_tws`` resolves to the same class. Plain
+``ibkr`` still means the REST Data Downloader source, which is unchanged.
 
 Connection settings can also be passed directly, which overrides the
 environment:

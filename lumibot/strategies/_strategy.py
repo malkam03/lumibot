@@ -3270,8 +3270,6 @@ class _Strategy:
                 # Distinct from "ibkr" above, which uses the hosted Data Downloader.
                 "ibkr_tws": "InteractiveBrokersTWSBacktesting",
                 "interactive_brokers_tws": "InteractiveBrokersTWSBacktesting",
-                "ibkr_socket": "InteractiveBrokersTWSBacktesting",
-                "ibkr_gateway": "InteractiveBrokersTWSBacktesting",
                 "polymarket": "PolymarketBacktesting",
                 "polymarket_clob": "PolymarketBacktesting",
                 "router": "RoutedBacktestingPandas",
