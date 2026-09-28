@@ -1810,16 +1810,16 @@ def get_price_data_from_ibkr_tws(
         for d in still_missing
         if d in authoritative_sessions and _session_is_closed(session_closes.get(d), d, now_utc)
     ]
+    unresolved = [d for d in still_missing if d not in set(placeholders)]
     df_all = update_cache(
         cache_file,
         df_all,
         placeholders,
         session_closes=session_closes,
         meta=meta,
-        replace_existing=force_cache_update,
+        replace_existing=force_cache_update and download_error is None and not unresolved,
     )
 
-    unresolved = [d for d in still_missing if d not in set(placeholders)]
     if unresolved:
         logger.warning(
             "IB Gateway/TWS history for %s (%s) is still missing %d session(s) "

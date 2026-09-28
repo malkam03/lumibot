@@ -761,6 +761,67 @@ def test_force_cache_update_replaces_stale_rows_even_when_response_is_empty(cach
     assert helper._missing_mask(cached).any()
 
 
+def test_incomplete_force_refresh_preserves_cached_rows(cache_dir, config):
+    asset = Asset("SPY")
+    start, end = dt.datetime(2024, 1, 3), dt.datetime(2024, 1, 4)
+    original = make_minute_bars(dt.date(2024, 1, 3), 390) + make_minute_bars(
+        dt.date(2024, 1, 4), 390
+    )
+    _run(asset, start, end, client=FakeClient(default=original), config=config)
+
+    # A truncated response reaches only the newest requested session. The older
+    # one remains unresolved, so the forced refresh must merge rather than replace.
+    partial_client = FakeClient(default=make_minute_bars(dt.date(2024, 1, 4), 390))
+    refreshed = helper.get_price_data_from_ibkr_tws(
+        asset,
+        start,
+        end,
+        timespan="minute",
+        config=config,
+        client=partial_client,
+        force_cache_update=True,
+        show_progress=False,
+        now=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
+    )
+
+    dates = set(refreshed.index.tz_convert(EASTERN).date)
+    assert dates == {dt.date(2024, 1, 3), dt.date(2024, 1, 4)}
+    assert len(refreshed) == 780
+
+
+def test_failed_force_refresh_preserves_cached_rows(cache_dir, config):
+    asset = Asset("SPY")
+    start = end = dt.datetime(2024, 1, 3)
+    original = make_minute_bars(dt.date(2024, 1, 3), 390)
+    _run(asset, start, end, client=FakeClient(default=original), config=config)
+
+    with pytest.raises(helper.IBKRTWSTimeoutError):
+        helper.get_price_data_from_ibkr_tws(
+            asset,
+            start,
+            end,
+            timespan="minute",
+            config=config,
+            client=FakeClient(default=helper.IBKRTWSTimeoutError("request timed out")),
+            force_cache_update=True,
+            show_progress=False,
+            now=dt.datetime(2024, 6, 1, tzinfo=dt.timezone.utc),
+        )
+
+    cache_file = helper.build_cache_filename(
+        asset,
+        "minute",
+        None,
+        what_to_show=config.what_to_show,
+        use_rth=config.use_rth,
+        exchange=config.exchange,
+        currency=config.currency,
+    )
+    cached = helper.load_cache(cache_file)
+    assert cached is not None
+    assert len(helper._real_rows(cached)) == 390
+
+
 def test_returned_frame_is_filtered_to_the_requested_range(cache_dir, config):
     asset = Asset("SPY")
     bars = make_minute_bars(dt.date(2024, 1, 3), 390) + make_minute_bars(dt.date(2024, 1, 4), 390)
