@@ -479,6 +479,19 @@ INTERACTIVE_BROKERS_REST_CONFIG = {
     "VERIFY_SSL": os.environ.get("IB_VERIFY_SSL"),
 }
 
+# Interactive Brokers Gateway/TWS socket API backtesting data source configuration.
+# This is the direct "TWS API" historical-data path (BACKTESTING_DATA_SOURCE=ibkr_tws),
+# not the hosted Data Downloader used by INTERACTIVE_BROKERS_REST_CONFIG.
+INTERACTIVE_BROKERS_TWS_BACKTESTING_CONFIG = {
+    "IP": os.environ.get("INTERACTIVE_BROKERS_IP", "127.0.0.1"),
+    "SOCKET_PORT": int(os.environ.get("INTERACTIVE_BROKERS_PORT")) if os.environ.get("INTERACTIVE_BROKERS_PORT") else None,
+    "CLIENT_ID": int(os.environ.get("IBKR_BACKTEST_CLIENT_ID")) if os.environ.get("IBKR_BACKTEST_CLIENT_ID") else None,
+    "WHAT_TO_SHOW": os.environ.get("IBKR_BACKTEST_WHAT_TO_SHOW"),
+    "USE_RTH": os.environ.get("IBKR_BACKTEST_USE_RTH"),
+    "TIMEOUT": os.environ.get("IBKR_BACKTEST_TIMEOUT"),
+    "MAX_REQUESTS_PER_10MIN": os.environ.get("IBKR_BACKTEST_MAX_REQUESTS_PER_10MIN"),
+}
+
 # Tradovate Configuration
 TRADOVATE_CONFIG = {
     "USERNAME": os.environ.get("TRADOVATE_USERNAME"),

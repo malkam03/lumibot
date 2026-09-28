@@ -210,6 +210,7 @@ _BACKTESTING_CLASS_MODULES = {
     "CcxtBacktesting": "lumibot.backtesting.ccxt_backtesting",
     "DataBentoDataBacktesting": "lumibot.backtesting.databento_backtesting",
     "InteractiveBrokersRESTBacktesting": "lumibot.backtesting.interactive_brokers_rest_backtesting",
+    "InteractiveBrokersTWSBacktesting": "lumibot.backtesting.interactive_brokers_tws_backtesting",
     "PolymarketBacktesting": "lumibot.backtesting.polymarket_backtesting",
     "PolygonDataBacktesting": "lumibot.backtesting.polygon_backtesting",
     "RoutedBacktestingPandas": "lumibot.backtesting.routed_backtesting",
@@ -225,6 +226,10 @@ DataBentoDataBacktesting = lazy_class("lumibot.backtesting.databento_backtesting
 InteractiveBrokersRESTBacktesting = lazy_class(
     "lumibot.backtesting.interactive_brokers_rest_backtesting",
     "InteractiveBrokersRESTBacktesting",
+)
+InteractiveBrokersTWSBacktesting = lazy_class(
+    "lumibot.backtesting.interactive_brokers_tws_backtesting",
+    "InteractiveBrokersTWSBacktesting",
 )
 PolymarketBacktesting = lazy_class("lumibot.backtesting.polymarket_backtesting", "PolymarketBacktesting")
 PolygonDataBacktesting = lazy_class("lumibot.backtesting.polygon_backtesting", "PolygonDataBacktesting")
@@ -3261,6 +3266,12 @@ class _Strategy:
                 "ibkr": "InteractiveBrokersRESTBacktesting",
                 "interactivebrokersrest": "InteractiveBrokersRESTBacktesting",
                 "interactive_brokers_rest": "InteractiveBrokersRESTBacktesting",
+                # Direct IB Gateway / TWS socket API ("TWS API") historical data.
+                # Distinct from "ibkr" above, which uses the hosted Data Downloader.
+                "ibkr_tws": "InteractiveBrokersTWSBacktesting",
+                "interactive_brokers_tws": "InteractiveBrokersTWSBacktesting",
+                "ibkr_socket": "InteractiveBrokersTWSBacktesting",
+                "ibkr_gateway": "InteractiveBrokersTWSBacktesting",
                 "polymarket": "PolymarketBacktesting",
                 "polymarket_clob": "PolymarketBacktesting",
                 "router": "RoutedBacktestingPandas",
