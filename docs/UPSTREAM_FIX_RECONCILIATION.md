@@ -2,7 +2,7 @@
 
 Records the local fork fixes compared against canonical upstream.
 
-Last Updated: 2026-09-25
+Last Updated: 2026-09-28
 
 Status: Active
 
@@ -19,7 +19,7 @@ Canonical upstream: `Lumiwealth/lumibot`
 
 Fork branch inspected: `malkam03-dev`
 
-Canonical branch compared: `upstream/dev`
+Canonical branch compared: `upstream/dev` (merged through `4.6.2`)
 
 ## Reconciliation Table
 
@@ -30,9 +30,25 @@ Canonical branch compared: `upstream/dev`
 | `9a0f8652` | Use minute-granularity timeshift for Yahoo intraday fills while preserving one-day timeshift for Yahoo daily fills. | Novel LumiBot bug fix. | No matching LumiBot issue or PR was found. `git blame` shows Yahoo fill timeshift was globally set to `-1 day`, while newer Yahoo paths can request minute data and need a minute-level fill lookup. | Add/keep a regression test that proves Yahoo minute fills request `timedelta(minutes=-1)` and day fills keep `timedelta(days=-1)`. | Candidate for its own upstream PR or direct merge after validation and review. |
 | `103ef76b` | Add the upstream-fix reconciliation skill. | Local workflow documentation, not a runtime fix. | Not searched as a product bug; this supports fork maintenance workflow. | Keep local unless maintainers explicitly want the skill upstreamed. | No upstream merge planned by default. |
 
-## Current Working Tree Note
+## Upstream Merge Status
 
-During reconciliation, a regression test was added in
-`tests/test_market_infinite_loop_bug.py` to cover the Yahoo fill-timeshift fix.
-It should be validated and committed with the fill-timeshift fix if that fix is
-kept or upstreamed.
+`upstream/dev` was merged into `malkam03-dev` on 2026-09-28, bringing the fork
+from `4.6.0` to `4.6.2` (55 commits, merge commit `93b3a755`). The merge was
+conflict-free: upstream modified none of the files the fork's fixes patch.
+
+Verification at merge time:
+
+- Full unit suite (`-m "not apitest and not downloader"`, excluding
+  `tests/backtest/`) passed before and after the merge: 3049 → 3159 passed,
+  zero failures. The increase is upstream's own new tests.
+- `9a0f8652`'s minute-granularity timeshift survived the merge intact, and its
+  regression test in `tests/test_market_infinite_loop_bug.py` passes (committed
+  as `8bf50265`).
+- Upstream's new intraday lookahead work (`be0df267`, `16ed3345`) lives in
+  `lumibot/entities/data.py` and guards only on `timeshift >= 0`. The fork's
+  Yahoo fix passes negative timeshifts through
+  `YahooData._get_filtered_end_index()` in `lumibot/data_sources/yahoo_data.py`,
+  a separate code path, so the two do not double-apply.
+- Lumiwealth/lumibot#1163 (matching `4273e288`) remains OPEN, and
+  `lumibot/tools/yahoo_helper.py` still lacks `146e4171`'s chunked minute
+  fetching upstream. Both rows above stand unchanged.
