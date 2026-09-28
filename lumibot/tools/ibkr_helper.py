@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -77,6 +77,37 @@ IBKR_DAILY_GAP_REPAIR_MAX_SESSIONS_PER_SEGMENT = 10
 IBKR_HOURLY_GAP_REPAIR_TIMEOUT_SECONDS = 300.0
 IBKR_HOURLY_INTERNAL_GAP_THRESHOLD = timedelta(days=7)
 IBKR_HOURLY_GAP_REPAIR_MAX_SEGMENTS_PER_SERIES = 4
+# Minute cache holes are repaired one missing session per request (one 1000-minute page
+# covers a whole extended-hours session). Repair stops for the process after this many
+# consecutive failed requests, because the downloader is then down, not the data missing.
+IBKR_MINUTE_GAP_REPAIR_MAX_CONSECUTIVE_FAILURES = 3
+IBKR_MINUTE_GAP_MARKER_REASON = "minute_session_gap_empty"
+# A failed repair request, or a series given up after consecutive failures, is retried after
+# this long in the same process (a notebook or multi-backtest service outlives an outage).
+IBKR_MINUTE_GAP_RETRY_COOLDOWN_SECONDS = 300.0
+# Serving a minute series with known unrepaired sessions logs a WARNING, at most this often
+# per series so a sliding-window caller does not log one per bar.
+IBKR_MINUTE_GAP_WARNING_INTERVAL_SECONDS = 60.0
+# Backward pagination of US stock intraday history steps over closed-market pages
+# (weekends, holidays, overnight) instead of treating their empty answer as the start
+# of history. A 1000-minute page is 16.7 hours, a weekend is about 56 closed hours.
+# The bound only guards against a calendar bug; a real walk skips one or two per gap.
+IBKR_MAX_CLOSED_PAGE_SKIPS = 2000
+# Consecutive empty futures pages during rule-calendar trading time that are stepped over
+# before the walk treats the empty answer as the start of history (holiday closes).
+IBKR_FUTURES_MAX_EMPTY_OPEN_PAGES = 3
+# Smallest daily page tried after IBKR says "Chart data unavailable" for a page that
+# reaches back before the contract's first bar (see _smaller_daily_period_after_chart_unavailable).
+IBKR_DAILY_MIN_PAGE_DAYS = 5
+# Daily windows up to this many days are requested as one exact "<N>d" page (N <= 1000,
+# which IBKR accepts); longer windows page with IBKR_STOCK_INDEX_DAILY_MAX_PERIOD.
+IBKR_DAILY_EXACT_PERIOD_MAX_DAYS = 993
+# Backward pagination writes collected pages to the cache every N pages, so a run that is
+# stopped mid-walk keeps its progress (a cold 8-month minute series takes hours).
+IBKR_PAGE_CHECKPOINT_EVERY = 10
+# How far behind real time IBKR stock/index intraday history can lag on the shared account
+# (observed 13 to 17 minutes). Intraday requests never ask for bars newer than this.
+IBKR_INTRADAY_HISTORY_DELAY = timedelta(minutes=20)
 IBKR_STOCK_INDEX_HOURLY_REPAIR_PERIOD = "2000h"
 
 IBKR_CONID_NEGATIVE_CACHE_TTL_SECONDS = 24 * 60 * 60  # 24h (persisted via BacktestCacheManager when enabled)
@@ -112,6 +143,21 @@ _RUNTIME_HOURLY_GAP_CHECKED_SERIES: Dict[
     str,
     tuple[tuple[int, str, str, int], datetime, datetime],
 ] = {}
+# series -> (cache signature, checked window start, end, recheck_at). recheck_at is the earliest
+# expiry of an empty-session marker in that window (None when there is none): after it the
+# window is scanned again, so a long-lived process asks for the session again.
+_RUNTIME_MINUTE_GAP_CHECKED_SERIES: Dict[
+    str,
+    tuple[tuple[int, str, str, int], datetime, datetime, Optional[datetime]],
+] = {}
+# Per-process memory for the minute-hole repair, in memory only, with monotonic timestamps so
+# it expires after IBKR_MINUTE_GAP_RETRY_COOLDOWN_SECONDS: sessions whose request failed, and
+# series whose repair stopped after consecutive failures. Without it a sliding-window caller
+# asked the same failing session on every bar; without the expiry a long-lived process kept a
+# hole after the downloader recovered.
+_RUNTIME_MINUTE_GAP_FAILED_SESSIONS: Dict[str, Dict[pd.Timestamp, float]] = {}
+_RUNTIME_MINUTE_GAP_REPAIR_STOPPED: Dict[str, float] = {}
+_RUNTIME_MINUTE_GAP_LAST_WARNING: Dict[str, float] = {}
 _DISABLE_CONIDS_REMOTE_UPLOAD = False
 _LOGGED_CONIDS_REMOTE_UPLOAD_DISABLE = False
 _LOGGED_HISTORY_ALIASES: set[str] = set()
@@ -460,6 +506,221 @@ def _us_equity_closed_interval(start_local: datetime, end_local: datetime, *, in
         return False
 
 
+def _period_to_timedelta(period: str) -> Optional[timedelta]:
+    """Parse an IBKR history `period` (``1000min``, ``5000min``, ``1000h``, ``45d``)."""
+    text = (period or "").strip().lower()
+    for suffix, unit, scale in (
+        ("min", "minutes", 1),
+        ("sec", "seconds", 1),
+        ("h", "hours", 1),
+        ("d", "days", 1),
+        ("w", "days", 7),
+        ("y", "days", 365),
+        ("m", "days", 30),
+    ):
+        if text.endswith(suffix):
+            number = text[: -len(suffix)]
+            if number.isdigit() and int(number) > 0:
+                return timedelta(**{unit: int(number) * scale})
+            return None
+    return None
+
+
+def _ibkr_history_now_utc() -> datetime:
+    """Wall clock for history requests (a seam so tests can pin "now")."""
+    return datetime.now(timezone.utc)
+
+
+def _ibkr_monotonic() -> float:
+    """Monotonic clock for in-process cooldowns (a seam so tests can advance it)."""
+    return time.monotonic()
+
+
+def _is_chart_data_unavailable(exc: BaseException) -> bool:
+    return "chart data unavailable" in str(exc).lower()
+
+
+def _smaller_daily_period_after_chart_unavailable(
+    exc: BaseException, *, asset_type: str, bar: str, period: str
+) -> Optional[str]:
+    """Half-size daily page to retry after IBKR's ``Chart data unavailable``.
+
+    IBKR returns that HTTP 500 when a daily page reaches back before the first bar it
+    holds for the contract (recent listings, or the last page of a long backtest).
+    Verified 2026-09-24: a 2022 listing failed with ``5y`` and returned 1002 bars with
+    ``4y``. Halving keeps the real bars that exist; None once the page is tiny.
+    """
+    if asset_type not in {"stock", "index"} or not (bar or "").strip().lower().endswith("d"):
+        return None
+    if not _is_chart_data_unavailable(exc):
+        return None
+    step = _period_to_timedelta(period)
+    if step is None:
+        return None
+    days = step.days // 2
+    if days < IBKR_DAILY_MIN_PAGE_DAYS:
+        return None
+    return f"{days}d"
+
+
+def _cursor_before_closed_equity_page(
+    *,
+    asset_type: str,
+    bar: str,
+    period: str,
+    cursor_end: datetime,
+    include_after_hours: bool,
+) -> Optional[datetime]:
+    """Where backward pagination continues after an empty US stock intraday page.
+
+    IBKR answers an empty list when the whole ``[cursor_end - period, cursor_end]`` page
+    is closed-market time. That is not the start of history. Returns the end of the next
+    page that can hold bars (stepping over further closed pages without a request), or
+    None when the empty page covered trading time and the old stop behavior applies.
+    Stocks use the NYSE calendar with the request's extended-hours flag. US indexes (SPX,
+    NDX, VIX) only print during the regular session (verified live 2026-09-24: an SPX page
+    ending Friday 21:00 UTC held 09:30 to 15:59 ET), so their overnight gap (17.5 hours) is
+    longer than a 1000-minute page too; they use the regular-session calendar. Futures
+    sessions differ and keep the old behavior.
+    """
+    if asset_type not in {"stock", "index"} or (bar or "").strip().lower().endswith("d"):
+        return None
+    step = _period_to_timedelta(period)
+    if step is None:
+        return None
+    calendar_extended_hours = bool(include_after_hours) if asset_type == "stock" else False
+    page_end = cursor_end
+    for _ in range(64):
+        page_start = page_end - step
+        if not _us_equity_closed_interval(page_start, page_end, include_after_hours=calendar_extended_hours):
+            if page_end != cursor_end:
+                return page_end
+            # The only open time in this empty page may be the quiet start of the session it ends
+            # in: a thin symbol's cache began at Monday 04:19 ET, the page ending there held Sunday
+            # plus 04:00 to 04:19 with no trades, and paging stopped (live, 2026-09-24). An empty
+            # answer there means "no trades yet", so continue from the previous session's close.
+            return _previous_close_if_only_session_start_is_open(
+                page_start=page_start, page_end=page_end, extended=calendar_extended_hours
+            )
+        page_end = page_start
+    return page_end
+
+
+def _cursor_before_closed_futures_page(
+    *,
+    asset_type: str,
+    bar: str,
+    period: str,
+    cursor_end: datetime,
+) -> Optional[datetime]:
+    """Where backward pagination continues after an empty US futures intraday page.
+
+    Same idea as `_cursor_before_closed_equity_page`, with the CME rule calendar
+    (`_us_futures_closed_interval`: weekends and the daily 17:00-18:00 ET break). Without it
+    every futures walk stopped at the first weekend: MES 1-minute for Sep 1 to 18, 2026 started
+    at the Sunday Sep 6 18:00 open (data matrix, 2026-09-25). Returns None when the empty page
+    covered open time by those rules.
+    """
+    if asset_type not in {"future", "cont_future"} or (bar or "").strip().lower().endswith("d"):
+        return None
+    step = _period_to_timedelta(period)
+    if step is None:
+        return None
+    page_end = cursor_end
+    for _ in range(64):
+        page_start = page_end - step
+        if not _us_futures_closed_interval(page_start, page_end):
+            return page_end if page_end != cursor_end else None
+        page_end = page_start
+    return page_end
+
+
+def _previous_close_if_only_session_start_is_open(
+    *, page_start: datetime, page_end: datetime, extended: bool
+) -> Optional[datetime]:
+    try:
+        end_ts = pd.Timestamp(page_end)
+        if end_ts.tzinfo is None:
+            end_ts = end_ts.tz_localize("UTC")
+        end_ns = int(end_ts.tz_convert("UTC").value)
+        year = int(end_ts.tz_convert("America/New_York").year)
+        bounds = [_us_equity_session_bounds_for_year(y, extended) for y in (year - 1, year)]
+        opens = np.concatenate([b[0] for b in bounds])
+        closes = np.concatenate([b[1] for b in bounds])
+        idx = int(np.searchsorted(opens, end_ns, side="left")) - 1
+        if idx < 1 or not (int(opens[idx]) < end_ns <= int(closes[idx])):
+            return None
+        session_open = pd.Timestamp(int(opens[idx]), unit="ns", tz="UTC").to_pydatetime()
+        if not _us_equity_closed_interval(page_start, session_open, include_after_hours=extended):
+            return None
+        return pd.Timestamp(int(closes[idx - 1]), unit="ns", tz="UTC").to_pydatetime()
+    except Exception:
+        return None
+
+
+def _previous_equity_session_close_before(
+    *,
+    asset_type: str,
+    bar: str,
+    earliest: datetime,
+    include_after_hours: bool,
+    page_start: Optional[datetime] = None,
+    page_was_capped: bool = False,
+) -> Optional[datetime]:
+    """Close of the last US equity session before ``earliest`` when only closed time lies between.
+
+    Backward pagination continues from the oldest bar received. When that bar opens a session,
+    anchoring the next 1000-minute page there makes it straddle the closed overnight or weekend
+    gap, so about half of every page was empty (production: ~1.8 requests per session).
+    Anchoring at the previous session's close gives one full page per session.
+    """
+    if asset_type not in {"stock", "index"} or (bar or "").strip().lower().endswith("d"):
+        return None
+    try:
+        extended = bool(include_after_hours) if asset_type == "stock" else False
+        earliest_ts = pd.Timestamp(earliest)
+        if earliest_ts.tzinfo is None:
+            earliest_ts = earliest_ts.tz_localize(LUMIBOT_DEFAULT_PYTZ)
+        earliest_ns = int(earliest_ts.tz_convert("UTC").value)
+        year = int(earliest_ts.tz_convert("America/New_York").year)
+        closes = np.concatenate(
+            [
+                _us_equity_session_bounds_for_year(year - 1, extended)[1],
+                _us_equity_session_bounds_for_year(year, extended)[1],
+            ]
+        )
+        idx = int(np.searchsorted(closes, earliest_ns, side="left")) - 1
+        if idx < 0:
+            return None
+        previous_close = pd.Timestamp(int(closes[idx]), unit="ns", tz="UTC").to_pydatetime()
+        if _us_equity_closed_interval(previous_close, earliest_ts.to_pydatetime(), include_after_hours=extended):
+            return previous_close
+        # Thin symbols often have no print at the session open (XLK's first pre-market trade is
+        # frequently 04:01 or later). If this page's window already reached back to the open of
+        # the session holding the oldest bar, and IBKR did not cut the page at its point cap,
+        # every bar that exists before the oldest bar in that session is already here.
+        if page_start is None or page_was_capped:
+            return None
+        opens = np.concatenate(
+            [
+                _us_equity_session_bounds_for_year(year - 1, extended)[0],
+                _us_equity_session_bounds_for_year(year, extended)[0],
+            ]
+        )
+        open_idx = int(np.searchsorted(opens, earliest_ns, side="right")) - 1
+        if open_idx < 0:
+            return None
+        session_open_ns = int(opens[open_idx])
+        page_start_ts = pd.Timestamp(page_start)
+        if page_start_ts.tzinfo is None:
+            page_start_ts = page_start_ts.tz_localize("UTC")
+        if int(page_start_ts.tz_convert("UTC").value) <= session_open_ns:
+            return previous_close
+        return None
+    except Exception:
+        return None
+
+
 def _history_segment_already_attempted(runtime_key: str, seg_start: datetime, seg_end: datetime) -> bool:
     for attempted_start, attempted_end in _RUNTIME_ATTEMPTED_HISTORY_SEGMENTS.get(runtime_key, ()):
         if attempted_start <= seg_start and seg_end <= attempted_end:
@@ -595,6 +856,17 @@ def get_price_data(
         _bar, _bar_seconds, timestep_component = _timestep_to_ibkr_bar(timestep)
     except Exception:
         timestep_component = _timestep_component(timestep)
+
+    # IBKR history for US stocks and indexes on the shared account runs about 13 to 17
+    # minutes behind real time. A request ending at "now" (a backtest whose end date is
+    # today, run during market hours) makes the downloader reject the newest page as
+    # `stale_tail`, and that page is the first one, so the series came back empty.
+    # Ask only for bars the feed can already have.
+    if asset_type in {"stock", "index"} and not str(timestep_component).endswith("day"):
+        latest_available = _ibkr_history_now_utc() - IBKR_INTRADAY_HISTORY_DELAY
+        if end_utc > latest_available:
+            end_utc = max(start_utc, latest_available)
+            end_local = end_utc.astimezone(LUMIBOT_DEFAULT_PYTZ)
 
     # Continuous futures
     #
@@ -1001,6 +1273,13 @@ def get_price_data(
                 continue
             _remember_attempted_history_segment(runtime_no_data_key, seg_start, seg_end)
             prev_max = df_cache.index.max() if not df_cache.empty else None
+            checkpoint_state = {"frame": df_cache}
+
+            def _checkpoint_pages(pages: pd.DataFrame, _state=checkpoint_state) -> None:
+                merged_so_far = _merge_frames(_state["frame"], pages)
+                _write_cache_frame(cache_file, merged_so_far)
+                _state["frame"] = merged_so_far
+
             try:
                 fetched = _fetch_history_between_dates(
                     asset=asset,
@@ -1012,6 +1291,7 @@ def get_price_data(
                     include_after_hours=include_after_hours,
                     source=history_source,
                     source_was_explicit=source_was_explicit,
+                    _page_checkpoint=_checkpoint_pages,
                 )
             except Exception as exc:
                 # Avoid crashing the entire backtest on entitlement/session issues. Return an empty
@@ -1170,6 +1450,25 @@ def get_price_data(
         and str(timestep_component).endswith("hour")
     ):
         df_cache = _repair_us_stock_index_hourly_gaps(
+            df_cache,
+            cache_file=cache_file,
+            asset=asset,
+            quote=quote,
+            timestep=timestep,
+            start_dt=start_utc,
+            end_dt=end_utc,
+            exchange=effective_exchange,
+            include_after_hours=include_after_hours,
+            source=history_source,
+            source_was_explicit=source_was_explicit,
+        )
+
+    elif (
+        not df_cache.empty
+        and asset_type in {"stock", "index"}
+        and str(timestep_component).endswith("minute")
+    ):
+        df_cache = _repair_us_stock_index_minute_gaps(
             df_cache,
             cache_file=cache_file,
             asset=asset,
@@ -2054,6 +2353,7 @@ def _fetch_history_between_dates(
     _queue_timeout: Optional[float] = None,
     _max_timeout_attempts: Optional[int] = None,
     _deadline_monotonic: Optional[float] = None,
+    _page_checkpoint: Optional[Callable[[pd.DataFrame], None]] = None,
 ) -> pd.DataFrame:
     conid = _resolve_conid(asset=asset, quote=quote, exchange=exchange)
     conid_refreshed = False
@@ -2071,6 +2371,9 @@ def _fetch_history_between_dates(
     cursor_end = _to_utc(end_dt)
     start_dt = _to_utc(start_dt)
     chunks: list[pd.DataFrame] = []
+    closed_pages_skipped = 0
+    futures_empty_open_pages = 0
+    checkpointed_pages = 0
 
     # Opt-in trace: log every real network fetch + caller, to audit cache-miss root causes.
     if os.environ.get("LUMIBOT_CACHE_MISS_DEBUG"):
@@ -2106,7 +2409,7 @@ def _fetch_history_between_dates(
                 conid=conid,
                 period=period,
                 bar=bar,
-                start_time=cursor_end,
+                start_time=_ibkr_page_request_end(cursor_end, bar_seconds, asset_type),
                 exchange=exchange,
                 include_after_hours=include_after_hours,
                 continuous=continuous,
@@ -2115,6 +2418,16 @@ def _fetch_history_between_dates(
                 max_timeout_attempts=_max_timeout_attempts,
             )
         except Exception as exc:
+            smaller_period = _smaller_daily_period_after_chart_unavailable(
+                exc, asset_type=asset_type, bar=bar, period=period
+            )
+            if smaller_period is not None:
+                period = smaller_period
+                continue
+            if chunks and asset_type in {"stock", "index"} and _is_chart_data_unavailable(exc):
+                # The page reaches before the first bar IBKR holds. Keep the real bars
+                # already collected instead of discarding the whole series.
+                break
             classification = classify_history_failure(exc)
             if (
                 not chunks
@@ -2163,12 +2476,57 @@ def _fetch_history_between_dates(
                     conid_refreshes=1,
                     reason=classification.reason,
                 )
-            if chunks and _deadline_monotonic is not None:
+            if chunks:
+                # A later (older) page failed. The newer pages are real bars: keep them
+                # and stop paging instead of raising, which used to discard every page
+                # already collected and leave the strategy with no bars at all. Nothing
+                # is negatively cached, so the missing older part stays retryable.
+                logger.warning(
+                    "IBKR history paging for %s timestep=%s stopped at an older page (%s); keeping %d real bars "
+                    "already collected back to %s",
+                    getattr(asset, "symbol", None),
+                    timestep,
+                    classification.reason,
+                    sum(len(chunk) for chunk in chunks),
+                    min(chunk.index.min() for chunk in chunks),
+                )
                 break
             raise
 
         # IBKR typically returns {"data":[...]} (empty list means no data).
         data = payload.get("data") if isinstance(payload, dict) else None
+        df = _history_payload_to_frame(data, source_was_explicit=source_was_explicit) if data else pd.DataFrame()
+        if df.empty:
+            skipped_to = _cursor_before_closed_equity_page(
+                asset_type=asset_type,
+                bar=bar,
+                period=period,
+                cursor_end=cursor_end,
+                include_after_hours=include_after_hours,
+            )
+            if skipped_to is None:
+                skipped_to = _cursor_before_closed_futures_page(
+                    asset_type=asset_type, bar=bar, period=period, cursor_end=cursor_end
+                )
+            if skipped_to is not None:
+                closed_pages_skipped += 1
+                if closed_pages_skipped <= IBKR_MAX_CLOSED_PAGE_SKIPS and skipped_to > start_dt:
+                    cursor_end = skipped_to
+                    continue
+            # Futures holiday closes (Good Friday, Christmas) are not in the simple CME rule
+            # calendar, so their empty pages look like trading time. Step back one page, a few
+            # times, before treating the empty answer as the start of history.
+            if (
+                chunks
+                and asset_type in {"future", "cont_future"}
+                and not (bar or "").strip().lower().endswith("d")
+                and futures_empty_open_pages < IBKR_FUTURES_MAX_EMPTY_OPEN_PAGES
+            ):
+                page_span = _period_to_timedelta(period)
+                if page_span is not None and cursor_end - page_span > start_dt:
+                    futures_empty_open_pages += 1
+                    cursor_end = cursor_end - page_span
+                    continue
         if not data:
             # If we already fetched earlier chunks, keep them and stop paging.
             # CME weekend/maintenance gaps (Fri 4pm CT → Sun 5pm CT, nightly 4–5pm CT)
@@ -2195,7 +2553,6 @@ def _fetch_history_between_dates(
                 )
             return pd.DataFrame()
 
-        df = _history_payload_to_frame(data, source_was_explicit=source_was_explicit)
         if df.empty:
             # Same rationale as the empty-data branch above: an intermediate empty
             # page during backward pagination must not discard earlier chunks.
@@ -2218,6 +2575,15 @@ def _fetch_history_between_dates(
             return pd.DataFrame()
 
         chunks.append(df)
+        futures_empty_open_pages = 0
+        if _page_checkpoint is not None and len(chunks) - checkpointed_pages >= IBKR_PAGE_CHECKPOINT_EVERY:
+            # Long cold walks take hours on the shared downloader. Hand the new pages to the
+            # caller now so a stopped or timed-out run keeps its progress for the next run.
+            try:
+                _page_checkpoint(pd.concat(chunks[checkpointed_pages:], axis=0).sort_index())
+                checkpointed_pages = len(chunks)
+            except Exception:
+                logger.debug("IBKR page checkpoint failed", exc_info=True)
 
         earliest = df.index.min()
         if earliest is None:
@@ -2233,6 +2599,17 @@ def _fetch_history_between_dates(
         next_cursor_end = earliest
         if next_cursor_end >= cursor_end:
             next_cursor_end = earliest - pd.Timedelta(seconds=bar_seconds)
+        page_span = _period_to_timedelta(period)
+        session_close = _previous_equity_session_close_before(
+            asset_type=asset_type,
+            bar=bar,
+            earliest=earliest,
+            include_after_hours=include_after_hours,
+            page_start=(cursor_end - page_span) if page_span is not None else None,
+            page_was_capped=len(df) >= IBKR_HISTORY_MAX_POINTS,
+        )
+        if session_close is not None and session_close < _to_utc(next_cursor_end):
+            next_cursor_end = session_close
         cursor_end = next_cursor_end
 
         # Do not assume `len(df) < 1000` implies we're at the start of history.
@@ -2266,6 +2643,34 @@ def _fetch_history_between_dates(
     return merged
 
 
+def _ibkr_page_request_end(cursor_end: datetime, bar_seconds: int, asset_type: str = "") -> datetime:
+    """Return the IBKR ``startTime`` for a page that must hold every bar starting before ``cursor_end``.
+
+    An IBKR history page ending at T holds bars up to T minus two bars: the bar that starts
+    one bar before T (and ends at T) is left out. Recorded live on 2026-09-25: SPY 1-minute
+    ending 20:00 ET stopped at 19:58, SPX 1-minute pages ending at the 16:00 ET close held
+    389 bars ending 15:58, and a QQQ 5-minute page ending 13:40 UTC stopped at 13:30. Pages
+    anchored at a session close lost every session's final bar, and a page continuing from
+    the previous page's earliest bar lost the bar just before it. Asking one bar later keeps
+    that bar; if IBKR ever includes the bar at T as well, the merge drops the duplicate.
+    Daily bars keep their request end unchanged.
+
+    US stock and index intraday requests never ask past the delayed-feed limit
+    (IBKR_INTRADAY_HISTORY_DELAY, see get_price_data): the shift used to put the first hourly
+    page about 40 minutes after now, which the downloader can reject as stale_tail. At the
+    limit the page keeps the old end; the bar it leaves out is too recent to be served yet.
+    Futures and crypto are not on that feed and keep the full shift.
+    """
+    if not bar_seconds or bar_seconds >= 24 * 60 * 60:
+        return cursor_end
+    shifted = cursor_end + timedelta(seconds=int(bar_seconds))
+    if asset_type in {"stock", "index"}:
+        latest_available = _ibkr_history_now_utc() - IBKR_INTRADAY_HISTORY_DELAY
+        if shifted > latest_available:
+            shifted = max(cursor_end, latest_available)
+    return shifted
+
+
 def _history_health_series_id(*, asset, quote, timestep, exchange, source, include_after_hours) -> str:
     instrument = {name: str(getattr(asset, name, "") or "")
                   for name in ("asset_type", "symbol", "expiration", "strike", "right", "multiplier")}
@@ -2283,9 +2688,14 @@ def _history_period_for_request(
     if asset_type in {"stock", "index", "option"} and normalized_bar.endswith("d"):
         if requested_start is not None and requested_end is not None:
             span = (_to_utc(requested_end) - _to_utc(requested_start)).total_seconds()
-            if 0 < span <= 365 * 86400:
+            if 0 < span <= IBKR_DAILY_EXACT_PERIOD_MAX_DAYS * 86400:
                 # The caller's full span includes lookback/prefetch. Never infer
                 # it from the simulation's visible dates or shrink it per bar.
+                #
+                # 2026-09-24: the limit was 365 days, so a one-year backtest plus an
+                # indicator lookback (~390 days) asked for a 5y page. The downloader's
+                # head probe never matches a 5y daily page and rebuilt every one (~35 s
+                # per symbol). IBKR accepts exact day periods up to 1000d.
                 days = math.ceil(span / 86400) + 7
                 return f"{days}d"
         return IBKR_STOCK_INDEX_DAILY_MAX_PERIOD
@@ -3218,6 +3628,403 @@ def _repair_us_stock_index_hourly_gaps(
         len(unresolved),
     )
     return working
+
+
+def _us_minute_session_fetch_window(
+    session_open: pd.Timestamp,
+    session_close: pd.Timestamp,
+    *,
+    asset_type: str,
+    include_after_hours: bool,
+) -> tuple[datetime, datetime]:
+    """Return the UTC window that holds every minute bar IBKR can have for one session."""
+    if asset_type == "stock" and include_after_hours:
+        day = pd.Timestamp(session_open).tz_convert(LUMIBOT_DEFAULT_PYTZ).normalize()
+        start = day + pd.Timedelta(hours=4)
+        end = day + pd.Timedelta(hours=20)
+    else:
+        start = pd.Timestamp(session_open)
+        end = pd.Timestamp(session_close)
+    return start.tz_convert(timezone.utc).to_pydatetime(), end.tz_convert(timezone.utc).to_pydatetime()
+
+
+def _missing_us_minute_sessions(
+    df_cache: pd.DataFrame,
+    *,
+    start_dt: datetime,
+    end_dt: datetime,
+    now: Optional[datetime] = None,
+) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+    """Return NYSE sessions inside the cached part of the window that have no minute bar.
+
+    Only sessions strictly between the first and the last real bar of the requested window
+    count: the window edges are handled by the edge checks in `get_price_data`. A session
+    with an unexpired `minute_session_gap_empty` marker (IBKR answered and had no bars for
+    it) is not returned again until the marker expires.
+    """
+    if df_cache is None or df_cache.empty:
+        return []
+
+    idx = pd.DatetimeIndex(df_cache.index)
+    if idx.tz is None:
+        idx = idx.tz_localize(LUMIBOT_DEFAULT_PYTZ)
+    else:
+        idx = idx.tz_convert(LUMIBOT_DEFAULT_PYTZ)
+
+    if "missing" in df_cache.columns:
+        missing_mask = df_cache["missing"].fillna(False).astype(bool).to_numpy()
+    else:
+        missing_mask = np.zeros(len(idx), dtype=bool)
+
+    start_local = pd.Timestamp(_to_utc(start_dt)).tz_convert(LUMIBOT_DEFAULT_PYTZ)
+    end_local = pd.Timestamp(_to_utc(end_dt)).tz_convert(LUMIBOT_DEFAULT_PYTZ)
+    real = idx[~missing_mask] if bool(missing_mask.any()) else idx
+    if not real.is_monotonic_increasing:
+        real = real.sort_values()
+    # Binary searches instead of per-row date math: this runs once per series and window, and
+    # a year of extended-hours minute bars is about 250,000 rows.
+    real_ns = real.asi8
+    lo = int(np.searchsorted(real_ns, start_local.value, side="left"))
+    hi = int(np.searchsorted(real_ns, end_local.value, side="right"))
+    if hi - lo < 2:
+        return []
+    real_ns = real_ns[lo:hi]
+
+    first_day = pd.Timestamp(int(real_ns[0]), unit="ns", tz="UTC").tz_convert(LUMIBOT_DEFAULT_PYTZ).normalize()
+    last_day = pd.Timestamp(int(real_ns[-1]), unit="ns", tz="UTC").tz_convert(LUMIBOT_DEFAULT_PYTZ).normalize()
+    if (last_day - first_day) <= pd.Timedelta(days=1):
+        return []
+
+    def _has_real_bar_on(day: pd.Timestamp) -> bool:
+        day_start = day.value
+        day_end = (day + pd.DateOffset(days=1)).value  # next local midnight, DST-safe
+        pos = int(np.searchsorted(real_ns, day_start, side="left"))
+        return pos < len(real_ns) and int(real_ns[pos]) < day_end
+
+    from lumibot.tools.helpers import get_trading_days
+
+    schedule = get_trading_days(
+        market="NYSE",
+        start_date=first_day.date(),
+        end_date=(last_day + pd.Timedelta(days=1)).date(),
+        tzinfo=LUMIBOT_DEFAULT_PYTZ,
+    )
+    if schedule is None or schedule.empty:
+        return []
+
+    fresh_marker_days: set[pd.Timestamp] = set()
+    if bool(missing_mask.any()) and {"missing_reason", "missing_retry_after"}.issubset(df_cache.columns):
+        reasons = df_cache["missing_reason"].fillna("").astype(str).to_numpy()
+        marker_mask = missing_mask & (reasons == IBKR_MINUTE_GAP_MARKER_REASON)
+        if bool(marker_mask.any()):
+            now_utc = pd.Timestamp(now or _ibkr_history_now_utc())
+            now_utc = now_utc.tz_localize(timezone.utc) if now_utc.tzinfo is None else now_utc.tz_convert(timezone.utc)
+            retry_after = pd.to_datetime(
+                df_cache.loc[marker_mask, "missing_retry_after"], utc=True, errors="coerce"
+            ).to_numpy()
+            for marker_day, retry in zip(idx[marker_mask].normalize(), retry_after):
+                if not pd.isna(retry) and pd.Timestamp(retry) > now_utc:
+                    fresh_marker_days.add(marker_day)
+
+    missing: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    opens = pd.DatetimeIndex(schedule["market_open"]).tz_convert(LUMIBOT_DEFAULT_PYTZ)
+    closes = pd.DatetimeIndex(schedule["market_close"]).tz_convert(LUMIBOT_DEFAULT_PYTZ)
+    for session_open, session_close in zip(opens, closes):
+        day = session_open.normalize()
+        if day <= first_day or day >= last_day:
+            continue
+        if day in fresh_marker_days or _has_real_bar_on(day):
+            continue
+        missing.append((session_open, session_close))
+    return missing
+
+
+def _minute_session_markers(
+    sessions: list[tuple[pd.Timestamp, pd.Timestamp]],
+    *,
+    retry_after: datetime,
+) -> pd.DataFrame:
+    if not sessions:
+        return pd.DataFrame()
+    count = len(sessions)
+    return pd.DataFrame(
+        {
+            "open": [pd.NA] * count,
+            "high": [pd.NA] * count,
+            "low": [pd.NA] * count,
+            "close": [pd.NA] * count,
+            "volume": [pd.NA] * count,
+            "missing": [True] * count,
+            "missing_retry_after": [retry_after.isoformat()] * count,
+            "missing_reason": [IBKR_MINUTE_GAP_MARKER_REASON] * count,
+        },
+        index=pd.DatetimeIndex([session_open for session_open, _ in sessions]),
+    )
+
+
+def _repair_us_stock_index_minute_gaps(
+    df_cache: pd.DataFrame,
+    *,
+    cache_file: Path,
+    asset: Asset,
+    quote: Optional[Asset],
+    timestep: str,
+    start_dt: datetime,
+    end_dt: datetime,
+    exchange: Optional[str],
+    include_after_hours: bool,
+    source: str,
+    source_was_explicit: bool,
+) -> pd.DataFrame:
+    """Fetch whole sessions missing inside a cached US stock/index minute series.
+
+    WHY (2026-09-25): the minute path only compared the edges of the requested window with
+    the cache. A cache holding June and September (two earlier backtests) served a June to
+    September backtest with July and August silently missing: no request, no error, and the
+    strategy saw one stale bar for weeks and made no trades. The same holes come from an
+    interrupted download (page checkpoints), from a failed older page (newer pages are
+    kept), and from LumiBot 4.6.0, which stopped paging at every weekend and wrote those
+    holes into the shared S3 cache.
+
+    Each missing session costs one request, the same as a cold walk. A session IBKR answers
+    with no bars (a thin symbol with no prints that day) gets a marker so later backtests do
+    not ask again until the marker expires. A failed request writes nothing, so the next
+    process retries it.
+
+    Cost bound (CodeRabbit on PR #1180 asked for a timer): at most one request per session in
+    the requested window, once per process, which is never more than downloading that window
+    cold (live 2026-09-25: a 10-session SPY hole took 10 requests, 52 s; the next call made
+    none). A session whose request failed is not asked again in this process until
+    IBKR_MINUTE_GAP_RETRY_COOLDOWN_SECONDS pass, repair pauses for the series for the same
+    cooldown after IBKR_MINUTE_GAP_REPAIR_MAX_CONSECUTIVE_FAILURES in a row, and every serve
+    of a series with known unrepaired sessions logs a WARNING (at most once a minute). There is
+    deliberately no wall-clock limit: it would leave July missing on a busy downloader and not
+    on a quiet one, which is the silent-hole bug this repair exists to fix.
+    """
+    quote_symbol = str(getattr(quote, "symbol", "USD") or "USD").strip().upper()
+    normalized_exchange = str(exchange or "").strip().upper()
+    if quote_symbol != "USD" or normalized_exchange not in {
+        "",
+        "SMART",
+        "NYSE",
+        "NASDAQ",
+        "ARCA",
+        "AMEX",
+        "IEX",
+        "CBOE",
+    }:
+        return df_cache
+
+    series_key = str(cache_file)
+    request_start = _to_utc(start_dt)
+    request_end = _to_utc(end_dt)
+    previous_check = _RUNTIME_MINUTE_GAP_CHECKED_SERIES.get(series_key)
+    if previous_check is not None:
+        checked_signature, checked_start, checked_end, recheck_at = previous_check
+        if (
+            checked_signature == _hourly_cache_signature(df_cache)
+            and checked_start <= request_start
+            and checked_end >= request_end
+            and (recheck_at is None or _ibkr_history_now_utc() < recheck_at)
+        ):
+            return df_cache
+
+    all_missing = _missing_us_minute_sessions(df_cache, start_dt=start_dt, end_dt=end_dt)
+    if not all_missing:
+        _RUNTIME_MINUTE_GAP_CHECKED_SERIES[series_key] = (
+            _hourly_cache_signature(df_cache),
+            request_start,
+            request_end,
+            _minute_marker_recheck_at(df_cache, start_dt=start_dt, end_dt=end_dt),
+        )
+        return df_cache
+
+    now_mono = _ibkr_monotonic()
+    cooldown = IBKR_MINUTE_GAP_RETRY_COOLDOWN_SECONDS
+    stopped_at = _RUNTIME_MINUTE_GAP_REPAIR_STOPPED.get(series_key)
+    if stopped_at is not None and now_mono - stopped_at < cooldown:
+        _warn_minute_series_served_with_holes(series_key, asset, timestep, all_missing, now_mono)
+        return df_cache
+    _RUNTIME_MINUTE_GAP_REPAIR_STOPPED.pop(series_key, None)
+
+    failed_before = _RUNTIME_MINUTE_GAP_FAILED_SESSIONS.setdefault(series_key, {})
+    missing = [
+        (session_open, session_close)
+        for session_open, session_close in all_missing
+        if now_mono - failed_before.get(session_open.normalize(), float("-inf")) >= cooldown
+    ]
+    if not missing:
+        _warn_minute_series_served_with_holes(series_key, asset, timestep, all_missing, now_mono)
+        return df_cache
+
+    asset_type = _normalize_asset_type(getattr(asset, "asset_type", ""))
+    logger.info(
+        "IBKR minute cache repair: %d session(s) missing inside the cached window for %s (%s to %s)",
+        len(missing),
+        getattr(asset, "symbol", None),
+        missing[0][0].date(),
+        missing[-1][0].date(),
+    )
+
+    working = df_cache
+    remaining = {session_open.normalize() for session_open, _ in missing}
+    empty_sessions: list[tuple[pd.Timestamp, pd.Timestamp]] = []
+    requests = 0
+    failed_requests = 0
+    consecutive_failures = 0
+    unsaved_pages = 0
+    # Newest first, like a cold walk. A page for multi-minute bars can cover several
+    # sessions; sessions it filled are skipped.
+    for session_open, session_close in reversed(missing):
+        day = session_open.normalize()
+        if day not in remaining:
+            continue
+        fetch_start, fetch_end = _us_minute_session_fetch_window(
+            session_open, session_close, asset_type=asset_type, include_after_hours=include_after_hours
+        )
+        requests += 1
+        try:
+            fetched = _fetch_history_between_dates(
+                asset=asset,
+                quote=quote,
+                timestep=timestep,
+                start_dt=fetch_start,
+                end_dt=fetch_end,
+                exchange=exchange,
+                include_after_hours=include_after_hours,
+                source=source,
+                source_was_explicit=source_was_explicit,
+                _record_missing_on_empty=False,
+            )
+        except Exception as exc:
+            failed_requests += 1
+            consecutive_failures += 1
+            failed_before[day] = _ibkr_monotonic()
+            logger.warning(
+                "IBKR minute cache repair could not fetch %s session %s: %s",
+                getattr(asset, "symbol", None),
+                day.date(),
+                exc,
+            )
+            if consecutive_failures >= IBKR_MINUTE_GAP_REPAIR_MAX_CONSECUTIVE_FAILURES:
+                _RUNTIME_MINUTE_GAP_REPAIR_STOPPED[series_key] = _ibkr_monotonic()
+                break
+            continue
+        consecutive_failures = 0
+        failed_before.pop(day, None)
+        if fetched is not None and not fetched.empty:
+            working = _merge_frames(working, fetched)
+            unsaved_pages += 1
+            fetched_idx = pd.DatetimeIndex(fetched.index)
+            fetched_idx = (
+                fetched_idx.tz_localize(LUMIBOT_DEFAULT_PYTZ)
+                if fetched_idx.tz is None
+                else fetched_idx.tz_convert(LUMIBOT_DEFAULT_PYTZ)
+            )
+            remaining.difference_update(fetched_idx.normalize().unique())
+        if day in remaining:
+            # IBKR answered for this session and had no bars in it.
+            remaining.discard(day)
+            empty_sessions.append((session_open, session_close))
+        if unsaved_pages >= IBKR_PAGE_CHECKPOINT_EVERY:
+            # Keep progress if the process is stopped during a long repair.
+            _write_cache_frame(cache_file, working)
+            unsaved_pages = 0
+
+    if empty_sessions:
+        retry_after = _ibkr_history_now_utc() + timedelta(seconds=IBKR_GAP_RETRY_TTL_SECONDS)
+        working = _merge_frames(working, _minute_session_markers(empty_sessions, retry_after=retry_after))
+
+    if not working.equals(df_cache):
+        _write_cache_frame(cache_file, working)
+
+    unresolved = _missing_us_minute_sessions(working, start_dt=start_dt, end_dt=end_dt)
+    record_history_health(
+        series_id=_history_health_series_id(asset=asset, quote=quote, timestep=timestep,
+            exchange=exchange, source=source, include_after_hours=include_after_hours),
+        symbol=str(getattr(asset, "symbol", "") or ""),
+        asset_type=asset_type,
+        timestep=timestep,
+        requested_start=request_start,
+        requested_end=request_end,
+        outcome=HistoryOutcome.COMPLETE if not unresolved else HistoryOutcome.PARTIAL,
+        expected_sessions=len(missing),
+        returned_sessions=len(missing) - len(unresolved),
+        missing_sessions=[session_open.date().isoformat() for session_open, _ in unresolved],
+        repair_attempts=requests,
+        transient_failures=failed_requests,
+        reason=None if not unresolved else "minute_sessions_missing_after_repair",
+    )
+    if unresolved:
+        # Not marked checked: a later call re-scans (milliseconds), warns, and retries the
+        # failed sessions once their cooldown has passed.
+        _warn_minute_series_served_with_holes(series_key, asset, timestep, unresolved, _ibkr_monotonic())
+    else:
+        _RUNTIME_MINUTE_GAP_CHECKED_SERIES[series_key] = (
+            _hourly_cache_signature(working),
+            request_start,
+            request_end,
+            _minute_marker_recheck_at(working, start_dt=start_dt, end_dt=end_dt),
+        )
+    return working
+
+
+def _minute_marker_recheck_at(df_cache: pd.DataFrame, *, start_dt: datetime, end_dt: datetime) -> Optional[datetime]:
+    """Earliest future expiry of an empty-session marker inside the window, or None."""
+    if df_cache is None or df_cache.empty or not {"missing", "missing_reason", "missing_retry_after"}.issubset(df_cache.columns):
+        return None
+    try:
+        idx = pd.DatetimeIndex(df_cache.index)
+        idx = idx.tz_localize(LUMIBOT_DEFAULT_PYTZ) if idx.tz is None else idx.tz_convert(LUMIBOT_DEFAULT_PYTZ)
+        mask = (
+            df_cache["missing"].fillna(False).astype(bool).to_numpy()
+            & (df_cache["missing_reason"].fillna("").astype(str).to_numpy() == IBKR_MINUTE_GAP_MARKER_REASON)
+            & (idx >= pd.Timestamp(_to_utc(start_dt))) & (idx <= pd.Timestamp(_to_utc(end_dt)))
+        )
+        if not bool(mask.any()):
+            return None
+        expiries = pd.to_datetime(df_cache.loc[mask, "missing_retry_after"], utc=True, errors="coerce").dropna()
+        now = pd.Timestamp(_ibkr_history_now_utc())
+        future = expiries[expiries > now]
+        return future.min().to_pydatetime() if len(future) else None
+    except Exception:
+        return None
+
+
+def _warn_minute_series_served_with_holes(
+    series_key: str,
+    asset: Asset,
+    timestep: str,
+    missing: list[tuple[pd.Timestamp, pd.Timestamp]],
+    now_mono: float,
+) -> None:
+    """Say loudly that bars are being served with sessions missing inside the window.
+
+    At most once a minute per series within one backtest. Each backtest data source sets its
+    own downloader queue client id, so a new backtest in the same process always warns.
+    """
+    try:
+        from lumibot.tools import data_downloader_queue_client as _queue
+
+        backtest_id = str(getattr(getattr(_queue, "_queue_client", None), "client_id", "") or "")
+    except Exception:
+        backtest_id = ""
+    warning_key = f"{series_key}|{backtest_id}"
+    last = _RUNTIME_MINUTE_GAP_LAST_WARNING.get(warning_key)
+    if last is not None and now_mono - last < IBKR_MINUTE_GAP_WARNING_INTERVAL_SECONDS:
+        return
+    _RUNTIME_MINUTE_GAP_LAST_WARNING[warning_key] = now_mono
+    logger.warning(
+        "IBKR %s %s history is missing %d session(s) inside the requested window (first %s, last %s); "
+        "the downloader could not supply them. They are retried after %.0f s in this process and by the "
+        "next backtest.",
+        getattr(asset, "symbol", None),
+        timestep,
+        len(missing),
+        missing[0][0].date(),
+        missing[-1][0].date(),
+        IBKR_MINUTE_GAP_RETRY_COOLDOWN_SECONDS,
+    )
 
 
 def _window_is_placeholder_covered(

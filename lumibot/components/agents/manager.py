@@ -40,6 +40,7 @@ NETWORK_TOOL_NAMES = frozenset(
     {
         "http_request",
         "rss_fetch",
+        "web_search",
         "browser_session_open",
         "browser_session_close",
         "browser_session_recover",
@@ -983,6 +984,7 @@ class AgentHandle:
         allow_network: bool | None = None,
         include_builtin_tools: bool = True,
         include_builtin_skills: bool = True,
+        skill_dirs: list[str | Path] | tuple[str | Path, ...] | None = None,
         rules_path: str | Path | None = None,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
@@ -1001,6 +1003,7 @@ class AgentHandle:
             raise ValueError("Unsupported agent reasoning_effort.")
         self.reasoning_effort = reasoning_effort
         self.include_builtin_skills = bool(include_builtin_skills)
+        self.skill_dirs = tuple(skill_dirs or ())
         self.rules_path = rules_path
         from .builtins import BuiltinTools
 
@@ -1296,6 +1299,7 @@ class AgentHandle:
             "Round down to whole shares when sizing positions.",
             "Before every order, check current cash, portfolio value, current positions, open orders, and the latest price of the asset you are ordering. A complete current injected snapshot satisfies the initial account and open-order checks for non-option orders. Before an option order, call account_portfolio, account_positions, and orders_open_orders in this run even when the snapshot is complete, as the options-trading skill requires. After any order mutation, Lumibot requires fresh complete account_positions and orders_open_orders pagination plus account_portfolio before another order.",
             "In your final decision, name the account state you relied on before any order (the injected snapshot's cash and portfolio value, or the account tools you called), and treat any upstream research or handoff packet as unverified evidence: say so and name what you independently revalidated. When you decide not to order, name the existing position or pending order that already covers the decision, or the missing condition that blocks it. Before relying on an existing position or pending order, call account_positions and orders_open_orders in this run; the injected snapshot can be stale about fills.",
+            "After an order fills, report the actual fill prices (avg_fill_price from orders_get_status), credit or debit, cash change, and resulting risk from fresh account reads, never the planned limit or pre-trade estimate. If a fill price or cash change is not available, say so instead of estimating it.",
             "Estimate the order's cash impact before submitting it. Ask whether the order is likely to create negative cash or additional leverage, and only do that when it is intentional for the strategy and suitable for the asset class.",
             "Margin and leverage behave differently across stocks, ETFs, options, futures, forex, crypto, brokers, and jurisdictions. Use judgment instead of assuming the same sizing rule works for every asset class.",
             "When switching from one asset to another, close or reduce the current position first to free up capital before buying the replacement.",
@@ -2022,7 +2026,20 @@ class AgentHandle:
             memory_state = self._memory_state(runtime_context)
             base_system_prompt = self._base_system_prompt(runtime_context)
             effective_system_prompt = self._compose_system_prompt(runtime_context)
-            if self.include_builtin_skills:
+            if self.skill_dirs:
+                # User skills are in play, so the fingerprint must span both
+                # sets or a cache hit or eval receipt would claim a run used
+                # skills it did not.
+                from .skills import resolve_skill_directories
+                from .skills import skill_fingerprint as _skill_fingerprint
+
+                skill_fingerprint = _skill_fingerprint(
+                    resolve_skill_directories(
+                        skill_dirs=self.skill_dirs,
+                        include_builtin=self.include_builtin_skills,
+                    )
+                )
+            elif self.include_builtin_skills:
                 from .skills import builtin_skill_fingerprint
 
                 skill_fingerprint = builtin_skill_fingerprint()
@@ -2851,6 +2868,7 @@ class AgentManager:
         _runtime: Any | None = None,
         include_builtin_tools: bool = True,
         include_builtin_skills: bool = True,
+        skill_dirs: list[str | Path] | tuple[str | Path, ...] | None = None,
         rules_path: str | Path | None = None,
         model_request_timeout_seconds: float | None = None,
         run_timeout_seconds: float | None = None,
@@ -2879,6 +2897,7 @@ class AgentManager:
             allow_network=allow_network,
             include_builtin_tools=include_builtin_tools,
             include_builtin_skills=include_builtin_skills,
+            skill_dirs=skill_dirs,
             rules_path=rules_path,
             model_request_timeout_seconds=model_request_timeout_seconds,
             run_timeout_seconds=run_timeout_seconds,

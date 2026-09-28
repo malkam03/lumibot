@@ -576,6 +576,7 @@ Table of Contents
 
    Home <self>
    Start Here / Python Setup <getting_started>
+   The lumibot Command <cli>
    Python Strategy Examples <examples>
    AI Quickstart <agents_quickstart>
    AI Examples <agents_examples>
@@ -586,6 +587,7 @@ Table of Contents
    :caption: AI trading
 
    AI Agent Guide <agents>
+   The Execution Gap <execution_gap>
    Compare AI Frameworks <ai_trading_project_comparison>
 
 .. toctree::

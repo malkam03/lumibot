@@ -41,6 +41,7 @@ lumibot run my-bot --paper
 ## Why LumiBot?
 
 - **Use Python rules, AI agents, or both.** Keep one familiar `Strategy` lifecycle.
+- **The decision reaches a broker.** A deterministic Python gate the model cannot talk past, real broker orders, and a trace you can open. [How it works](https://lumibot.lumiwealth.com/execution_gap.html)
 - **Backtest before connecting a broker.** Run historical simulations and view trades and results.
 - **Reuse your strategy across supported brokers.** Keep strategy logic separate from broker configuration.
 - **Start from working examples.** Choose stocks, macro, options, or a traditional buy-and-hold strategy.
