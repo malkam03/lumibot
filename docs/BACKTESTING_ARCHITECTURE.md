@@ -585,6 +585,41 @@ df = df[~all_zero]
 
 **Key Function:** `get_price_data_from_polygon()` (line 80)
 
+### 5b. IBKR Gateway/TWS socket (`interactive_brokers_tws_backtesting.py` → `ibkr_tws_helper.py`)
+
+Distinct from the IBKR Client Portal REST path above: this one talks to an IB Gateway or TWS
+that the *user* runs, over the official `ibapi` socket API, with no hosted Data Downloader
+dependency.
+
+**Flow:**
+1. `InteractiveBrokersTWSBacktesting` inherits from `PandasData` and owns one lazily-created
+   `IBKRTWSClient` that is reused for every asset in the run.
+2. Calls `ibkr_tws_helper.get_price_data_from_ibkr_tws()`, which caches parquet per
+   (asset, currency, exchange, timestep, whatToShow, RTH) under `LUMIBOT_CACHE_FOLDER/ibkr_tws`
+   with a `.meta.json` sidecar holding the cache schema version and contract identity.
+3. Scope v1 is stocks/ETFs (`STK`/`SMART`/`USD`) at `minute` and `day`. Everything else raises
+   `NotImplementedError`.
+
+**Invariants worth knowing (they are not obvious):**
+- **Coverage, not date presence, decides "cached".** `reqHistoricalData` anchors on
+  `endDateTime` and walks *backwards*, and a response capped at ~8190 bars silently loses its
+  **oldest** bars. Polygon's `get_missing_dates()` marks a date done if any row exists; that
+  rule would poison this cache. `compute_missing_sessions()` instead requires >= 90% of a
+  session's expected RTH minutes before it counts as covered.
+- **Only authoritative chunks may write "no data" placeholders**, and a chunk that returned
+  bars is authoritative only for sessions *newer* than its oldest returned bar
+  (`ChunkResult.authoritative_sessions()`). Failures, timeouts, and truncation leave sessions
+  uncached and retryable. Errors 200/326/354 raise instead of caching emptiness.
+- **Daily bars are re-stamped to the real session close** (16:00 ET, or the early close), and
+  the class sets `PREFER_NATIVE_DAY_BARS_FOR_STOCK_INDEX = True`, so `timestep="day"` can never
+  be satisfied by resampled minute data. Same lookahead rule as `ibkr_helper`.
+- **Datasets are keyed `(asset, quote, timestep)`** so minute and day data coexist.
+- Minute chunks are 14 calendar days, not "1 M": `"1 M"` returns exactly 8190 bars = 21 sessions
+  x 390 RTH minutes, i.e. right at the cap, so a 22-session month truncates.
+- Historical stock TRADES volume arrives in round lots, so a x100 multiplier is applied.
+
+**Key Function:** `get_price_data_from_ibkr_tws()`
+
 ### 6. Alpaca (`alpaca_backtesting.py`, bring your own key)
 
 **Flow:**
