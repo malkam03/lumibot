@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- New backtesting data source `InteractiveBrokersTWSBacktesting`, which downloads historical
+  bars directly from a user-run IB Gateway / TWS over the official `ibapi` socket API
+  (`reqHistoricalData`) with no dependency on the hosted Data Downloader service. Backed by
+  `lumibot/tools/ibkr_tws_helper.py`, which caches parquet under
+  `LUMIBOT_CACHE_FOLDER/ibkr_tws` so a repeated backtest makes zero network calls.
+  Scope v1 is stocks/ETFs (`STK`/`SMART`/`USD`) at minute and day timesteps; other asset types
+  raise `NotImplementedError`.
+- `BACKTESTING_DATA_SOURCE` accepts `ibkr_tws` and `interactive_brokers_tws`. Plain
+  `ibkr` still selects the existing REST source.
+- New environment variables `IBKR_BACKTEST_CLIENT_ID` (default 77),
+  `IBKR_BACKTEST_WHAT_TO_SHOW`, `IBKR_BACKTEST_USE_RTH`, `IBKR_BACKTEST_TIMEOUT`, and
+  `IBKR_BACKTEST_MAX_REQUESTS_PER_10MIN`, documented in
+  `docsrc/environment_variables.rst`. Connection host/port reuse the existing
+  `INTERACTIVE_BROKERS_IP` / `INTERACTIVE_BROKERS_PORT`.
+- Documentation page `docsrc/backtesting.interactive_brokers_tws.rst` and an architecture
+  section in `docs/BACKTESTING_ARCHITECTURE.md`.
+- Fixed IB Gateway/TWS data lookups so timestep-keyed datasets are reachable from
+  `get_last_price()` and `get_quote()`, and so an extended end date triggers a cache refresh.
+  Backtesting broker OHLC fills now use the inherited `PANDAS` source path. Added an opt-in
+  daily-cadence last-price capability flag, preserving explicit requested timestep selection.
+- Backtesting data sources can opt into the daily-cadence last-price shortcut with a
+  `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True` class attribute, in addition to the existing
+  class-name checks. `InteractiveBrokersTWSBacktesting` opts in.
+
+### Fixed
+- IBKR TWS backtests now ignore the generic strategy config object unless it is an
+  `IBKRTWSConfig`, preserve volumes in the units reported by TWS by default, retry sessions
+  still in progress, avoid caching daily bars outside the requested sessions, and truly replace
+  stale rows on forced cache refreshes. Cache lock protection is preserved during replacement.
+
 ## 4.6.0 - 2026-09-24
 
 4.6.0 is the first published release of this work. Tag `v4.5.92` was created but its release run stopped at the agent eval gate, so 4.5.92 was never published to PyPI. Everything planned for 4.5.92 ships here, renamed 4.6.0 because of the size of the AI agent changes.
