@@ -167,6 +167,34 @@ This repo is frequently edited by **multiple AI sessions**. To avoid lost work:
   - If the user explicitly requests a release PR, **the PR head must be the
     existing version branch** (e.g., `version/4.4.31`), not a new feature branch.
   - Do not switch branches unless explicitly instructed; if you suspect you're on the wrong branch, stop and ask.
+
+- **Fork integration branch (`malkam03-dev`):** this branch intentionally combines
+  fork work with upstream `dev` history so fork changes can later be proposed
+  upstream. When asked to sync upstream changes:
+  - Fetch `origin/dev` and `upstream/dev`, then compare their tips. If they
+    differ, establish which changes are missing from `origin/dev` before using
+    it as the sync source; do not silently substitute one remote for the other.
+  - Confirm the current branch is `malkam03-dev` and inspect the working tree
+    and branch graph before changing history.
+  - If `origin/dev` is already an ancestor of `HEAD`, report that it is already
+    included rather than creating a redundant merge.
+  - Otherwise merge `origin/dev` into `malkam03-dev`. Do not rebase, reset, or
+    cherry-pick the mixed branch as a substitute for this sync; preserving both
+    fork and upstream commit ancestry makes later upstream proposals auditable.
+  - Preserve fork-only changes when resolving conflicts, run relevant tests, and
+    update `docs/UPSTREAM_FIX_RECONCILIATION.md` when the sync changes what is
+    known about upstream overlap. Do not push unless explicitly requested.
+  - **Upstream contribution flow:** keep `malkam03-dev` as the integration
+    branch. When explicitly asked to propose selected fork features upstream,
+    create a separate branch in the fork based on current `upstream/dev`, then
+    cherry-pick only the feature commits needed for that proposal. Do not
+    cherry-pick integration merge commits or open a PR from the mixed
+    `malkam03-dev` branch. Verify the contribution branch contains only the
+    intended changes, resolve conflicts there, and run relevant tests. When
+    explicitly asked to open the PR, its base is `Lumiwealth/lumibot:dev` and
+    its head is the fork's contribution branch, not `malkam03-dev`. This keeps
+    upstream syncs flowing into the integration branch while allowing individual
+    fork features to be reviewed upstream independently.
 - **No “feature branch chaining”:** if you’re already on a feature/WIP or version branch (e.g., `feature/*`, `fix/*`, `wip/*`, `version/*`, `release/*`, or a version-named branch like `X.Y.Z`), keep working there; don’t create another feature branch from it unless explicitly instructed.
 - **Branch naming (LumiBot convention):** prefer version-scoped branches so multiple agents can collaborate without “feature branch naming drift”. Use the repo’s existing convention (e.g., `4.4.25` or `version/X.Y.Z`).
   - Default for active release work: the shared version branch (e.g., `4.4.25`).
