@@ -585,6 +585,45 @@ INTERACTIVE_BROKERS_IP
 - Values: IP address string.
 - Default: ``127.0.0.1``.
 
+IBKR_BACKTEST_CLIENT_ID
+^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Dedicated API client id used by ``InteractiveBrokersTWSBacktesting``
+  when downloading historical bars from IB Gateway/TWS. Kept high so it never
+  collides with the client ids used by live strategies.
+- Values: Integer.
+- Default: ``77``.
+
+IBKR_BACKTEST_WHAT_TO_SHOW
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: IB ``whatToShow`` value for historical backtest downloads.
+- Values: ``TRADES``, ``MIDPOINT``, ``BID``, ``ASK``, etc.
+- Default: ``TRADES``.
+
+IBKR_BACKTEST_USE_RTH
+^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Restrict historical backtest bars to regular trading hours.
+- Values: ``1`` / ``true`` (RTH only) or ``0`` / ``false`` (include extended hours).
+- Default: ``1``.
+
+IBKR_BACKTEST_TIMEOUT
+^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Seconds to wait for a single IB historical-data response before
+  cancelling the request and raising.
+- Values: Number of seconds.
+- Default: ``120``.
+
+IBKR_BACKTEST_MAX_REQUESTS_PER_10MIN
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Client-side historical-data pacing budget. IB's hard limit is 60
+  requests per rolling 10 minutes; the default leaves headroom.
+- Values: Integer.
+- Default: ``55``.
+
 IB_SUBACCOUNT
 ^^^^^^^^^^^^^
 

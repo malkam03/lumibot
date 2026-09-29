@@ -600,6 +600,64 @@ df = df[~all_zero]
 
 **Key Function:** `get_price_data_from_polygon()` (line 80)
 
+### 5b. IBKR Gateway/TWS socket (`interactive_brokers_tws_backtesting.py` → `ibkr_tws_helper.py`)
+
+Distinct from the IBKR Client Portal REST path above: this one talks to an IB Gateway or TWS
+that the *user* runs, over the official `ibapi` socket API, with no hosted Data Downloader
+dependency.
+
+**Flow:**
+1. `InteractiveBrokersTWSBacktesting` inherits from `PandasData` and owns one lazily-created
+   `IBKRTWSClient` that is reused for every asset in the run.
+2. Calls `ibkr_tws_helper.get_price_data_from_ibkr_tws()`, which caches parquet per
+   (asset, currency, exchange, timestep, whatToShow, RTH) under `LUMIBOT_CACHE_FOLDER/ibkr_tws`
+   with a `.meta.json` sidecar holding the cache schema version and contract identity.
+3. Scope v1 is stocks/ETFs (`STK`/`SMART`/`USD`) at `minute` and `day`. Everything else raises
+   `NotImplementedError`.
+
+**Invariants worth knowing (they are not obvious):**
+- **Coverage, not date presence, decides "cached".** `reqHistoricalData` anchors on
+  `endDateTime` and walks *backwards*, and a response capped at ~8190 bars silently loses its
+  **oldest** bars. Polygon's `get_missing_dates()` marks a date done if any row exists; that
+  rule would poison this cache. `compute_missing_sessions()` instead requires >= 90% of a
+  completed session's expected RTH minutes before it counts as covered; in-progress sessions
+  remain retryable even if a provisional response contains enough bars.
+- **Only authoritative chunks may write "no data" placeholders**, and a chunk that returned
+  usable, non-zero OHLC bars is authoritative only for sessions *newer* than its oldest such
+  bar (`ChunkResult.authoritative_sessions()`). Zero padding is not evidence of coverage.
+  Failures, timeouts, and truncation leave sessions uncached and retryable. Errors 200/326/354
+  raise instead of caching emptiness.
+- **Daily bars are re-stamped to the real session close** (16:00 ET, or the early close), and
+  the class sets `PREFER_NATIVE_DAY_BARS_FOR_STOCK_INDEX = True`, so `timestep="day"` can never
+  be satisfied by resampled minute data. Same lookahead rule as `ibkr_helper`.
+- **Datasets are keyed `(asset, quote, timestep)`** so minute and day data coexist. The inherited
+  `PandasData.get_last_price()` / `get_quote()` call `find_asset_in_data_store(asset, quote)`
+  *without* a timestep, and the base method only builds timestep-bearing candidate keys when a
+  timestep is given, so the class overrides `find_asset_in_data_store()` to fall back to
+  `minute` then `day` for untyped lookups. Explicit `get_last_price(..., timestep=...)` keeps
+  honoring the requested resolution. Without the fallback every loaded dataset was unreachable
+  and `get_last_price()` returned `None` forever. Cached in-memory data only skips refresh when
+  both the start and latest requested session are adequately covered, so extending the end date
+  fetches the new tail.
+- **`SOURCE` must stay `"PANDAS"`** (inherited, as Polygon/ThetaData/DataBento do).
+  `BacktestingBroker.process_pending_orders()` only runs its OHLC fill model for
+  `SOURCE == "PANDAS"` or a hard-coded provider name; a custom `SOURCE` leaves every order
+  pending forever with no error. `tests/test_ibkr_tws_strategy_backtest_e2e.py` runs a real
+  `Strategy.backtest()` and asserts an order fills, guarding both of these.
+- **Daily last-price shortcut is opt-in via `SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION = True`**
+  (checked by `Strategy._supports_daily_last_price_optimization()`), because the class name
+  does not contain the `"ibkr"` substring the legacy check looks for. Safe because day bars are
+  close-stamped. Portfolio valuation and order fills still call the source without a cadence
+  hint and so use minute bars; cadence inference (as ThetaData does) is a known follow-up.
+- Minute chunks are 14 calendar days, not "1 M": `"1 M"` returns exactly 8190 bars = 21 sessions
+  x 390 RTH minutes, i.e. right at the cap, so a 22-session month truncates.
+- Volume is preserved in the units reported by the configured TWS/API by default. Do not assume
+  round lots: IB can report either shares or round lots. Callers can set `volume_multiplier`
+  explicitly when they know the gateway's configured units. Forced cache rebuilds replace old
+  rows under the cache lock, including when the refreshed response contains no real bars.
+
+**Key Function:** `get_price_data_from_ibkr_tws()`
+
 ### 6. Alpaca (`alpaca_backtesting.py`, bring your own key)
 
 **Flow:**

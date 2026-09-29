@@ -5,6 +5,8 @@
 LumiBot is open source. Never put private, account-specific, or
 machine-specific information in this file or any other tracked repo file.
 
+PII includes personal (non-public) names and contact details, postal addresses, government identifiers, dates of birth, and account/customer identifiers.
+
 - Do not include usernames, passwords, API keys, tokens, account emails,
   customer identifiers, broker credentials, paid vendor credentials, private
   hostnames, private URLs, cookies, local profile paths, or absolute personal
@@ -16,6 +18,14 @@ machine-specific information in this file or any other tracked repo file.
   public environment variable names or their own secret manager.
 - If sensitive data is needed for private BotSpot/Lumiwealth operations, keep it
   in private repos/docs/secret stores, not in this public LumiBot checkout.
+- Before pushing or creating/updating a pull request, review the full diff, PR
+  title/body, and attachments for PII, secrets, account-specific data, and
+  machine-specific details. Run a suitable scanner and manually review the results;
+  use safe placeholders for examples and never repeat discovered sensitive values
+  in chat or review comments.
+- Show the requester the reviewed code/diff and PII-review result, then wait for explicit
+  approval before pushing commits or creating/updating a pull request. Implementing
+  a change does not itself authorize publishing it.
 
 ## BotSpot integration release qualification
 
