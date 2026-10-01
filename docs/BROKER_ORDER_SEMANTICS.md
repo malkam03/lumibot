@@ -86,6 +86,11 @@ peers, both transmitted, with the same `ocaGroup` and `ocaType=1` and no
 duration, and `eTradeOnly=False`/`firmQuoteOnly=False`. The adapter rejects
 unsupported or nested children, mismatched asset/quantity/duration/side,
 and stop-limit/trailing child types; it never substitutes a plain stop.
+Simple stop-limit orders and stop-limit parents use `stop_limit_price` for the
+native limit price and reject missing prices. Timezone-aware GTD expiration
+values are converted to UTC for IB; naive values retain local-wall-time
+formatting. Registered native child IDs identify tracked child orders before
+submission, while an OCO container is not tracked as a native order.
 
 Offline regression coverage is in
 `tests/test_interactive_brokers_advanced_orders.py`. Issue

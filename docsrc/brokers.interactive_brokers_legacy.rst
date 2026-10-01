@@ -24,6 +24,11 @@ Children must have the same asset, quantity, time-in-force, and good-till date
 as the parent, with an opposing action for attached exits or matching action
 for OCO peers. Invalid child counts, nested orders, and stop-limit/trailing
 children are rejected rather than silently mapped to different order types.
+Native stop-limit entry and simple orders require both ``stop_price`` and
+``stop_limit_price``. Timezone-aware ``good_till_date`` values are sent in UTC;
+naive datetimes retain Gateway-local wall-time formatting. Native child status
+and fill callbacks update the corresponding tracked child orders.
+
 Automatically generated children currently use ``DAY``. A non-``DAY`` parent
 created with generated children is rejected before submission. For non-``DAY``
 advanced orders, provide explicit children with matching durations. Conversion

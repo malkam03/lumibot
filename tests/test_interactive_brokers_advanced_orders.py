@@ -1,11 +1,14 @@
 """Offline contract tests for the legacy TWS native-order converter."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
-from lumibot.brokers.interactive_brokers import IBApp
+from lumibot.brokers.interactive_brokers import IBApp, InteractiveBrokers
 from lumibot.entities import Asset, Order
+from lumibot.trading_builtins import SafeList
 
 
 @pytest.fixture
@@ -237,3 +240,102 @@ def test_simple_order_retains_type_fields_and_duration(app, asset):
     assert_common([native], [2000], "GTC")
     assert native.orderType == "STP"
     assert native.auxPrice == 83
+
+
+def test_stop_limit_uses_stop_limit_price_and_rejects_missing_limit(app, asset):
+    order = make_order(
+        asset, order_class="simple", order_type="stop_limit",
+        stop_price=83, stop_limit_price=82,
+    )
+    (native,) = app.create_order(order)
+    assert native.orderType == "STP LMT"
+    assert native.auxPrice == 83
+    assert native.lmtPrice == 82
+
+    order.stop_limit_price = None
+    with pytest.raises(ValueError, match="stop_limit_price"):
+        app.create_order(order)
+
+
+def test_aware_gtd_is_sent_in_utc(app, asset):
+    local_expiry = datetime(2026, 11, 2, 16, tzinfo=timezone(timedelta(hours=-5)))
+    order = make_order(
+        asset, order_class="simple", limit_price=101, time_in_force="gtd",
+        good_till_date=local_expiry,
+    )
+    (native,) = app.create_order(order)
+    assert native.goodTillDate == "20261102 21:00:00 UTC"
+    child = Order(
+        strategy="conversion-test", asset=asset, quantity=2, side="sell",
+        stop_price=83, time_in_force="gtd", good_till_date=local_expiry,
+    )
+    attached = make_order(
+        asset, order_class="oto", child_orders=[child],
+        time_in_force="gtd", good_till_date=local_expiry,
+    )
+    assert [
+        leg.goodTillDate for leg in app.create_order(attached)
+    ] == ["20261102 21:00:00 UTC"] * 2
+
+
+def test_stop_limit_parent_retains_both_prices(app, asset):
+    order = make_order(
+        asset, order_type="stop_limit", stop_price=101, stop_limit_price=102,
+        secondary_stop_price=83,
+    )
+    parent, stop = app.create_order(order)
+    assert parent.orderType == "STP LMT"
+    assert parent.auxPrice == 101
+    assert parent.lmtPrice == 102
+    assert stop.orderType == "STP"
+    assert stop.auxPrice == 83
+
+
+@pytest.mark.parametrize("order_class,prices,expected_ids", [
+    ("simple", {"limit_price": 101}, [2001]),
+    ("bracket", {"secondary_limit_price": 117, "secondary_stop_price": 83}, [2001, 2002, 2003]),
+    ("oto", {"secondary_stop_price": 83}, [2001, 2002]),
+    ("oco", {"limit_price": 117, "stop_price": 83}, [2001, 2002]),
+])
+def test_submitted_children_are_tracked_before_native_placement(
+    app, asset, order_class, prices, expected_ids,
+):
+    broker = object.__new__(InteractiveBrokers)
+    broker.ib = app
+    broker.subaccount = None
+    broker._unprocessed_orders = SafeList(None)
+    broker.get_tracked_order = lambda identifier: next(
+        (item for item in broker._unprocessed_orders if item.identifier == identifier), None
+    )
+    broker.order_status_duplicates = []
+    broker._process_trade_event = Mock()
+    app.ib_broker = broker
+    app.wrapper = SimpleNamespace(init_new_orders=lambda: None)
+    app.create_contract = lambda *args, **kwargs: object()
+    app.placeOrder = Mock(side_effect=lambda native_id, contract, leg: (
+        broker.get_tracked_order(native_id) is not None
+        or (_ for _ in ()).throw(AssertionError("native leg placed before tracking"))
+    ))
+    order = make_order(asset, order_class=order_class, **prices)
+    order.quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
+    for child in order.child_orders:
+        child.quote = order.quote
+
+    broker._submit_order(order)
+
+    assert [call.args[0] for call in app.placeOrder.call_args_list] == expected_ids
+    assert [child.identifier for child in order.child_orders] == (
+        expected_ids[1:] if order_class != "oco" else expected_ids
+    )
+    assert [item.identifier for item in broker._unprocessed_orders] == expected_ids
+    if order_class != "oco":
+        assert all(child.parent_identifier == order.identifier for child in order.child_orders)
+    for child in order.child_orders:
+        broker.on_status_event(child.identifier, "Submitted", 0, 2, 0, 0, 0, 0, 0, "", 0)
+        broker.on_trade_event(
+            0, None, SimpleNamespace(orderId=child.identifier, cumQty=2, price=95, shares=2)
+        )
+    assert broker._process_trade_event.call_count == 2 * len(order.child_orders)
+    assert [
+        call.args[0] for call in broker._process_trade_event.call_args_list
+    ] == [child for child in order.child_orders for _ in range(2)]

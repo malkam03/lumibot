@@ -380,7 +380,8 @@ class InteractiveBrokers(Broker):
         if self.subaccount is not None:
             order.account = self.subaccount # to be tested
 
-        self._unprocessed_orders.append(order)
+        if order.order_class == OrderLum.OrderClass.MULTILEG:
+            self._unprocessed_orders.append(order)
         self.ib.execute_order(order)
         order.status = "submitted"
         return order
@@ -1561,14 +1562,26 @@ class IBApp(IBWrapper, IBClient):
             native.orderType = ORDERTYPE_MAPPING[order.order_type]
         except KeyError as exc:
             raise ValueError(f"Unsupported TWS order type: {order.order_type}") from exc
+        if order.order_type == OrderLum.OrderType.STOP_LIMIT:
+            if order.stop_price is None or order.stop_limit_price is None:
+                raise ValueError("TWS stop-limit requires stop_price and stop_limit_price")
+            native.lmtPrice = order.stop_limit_price
+        else:
+            native.lmtPrice = order.limit_price if order.limit_price is not None else 0
         native.totalQuantity = order.quantity
-        native.lmtPrice = order.limit_price if order.limit_price is not None else 0
         native.auxPrice = order.stop_price if order.stop_price is not None else ""
         native.trailingPercent = order.trail_percent if order.trail_percent is not None else ""
         if order.trail_price is not None:
             native.auxPrice = order.trail_price
         native.tif = order.time_in_force.upper()
-        native.goodTillDate = order.good_till_date.strftime("%Y%m%d %H:%M:%S") if order.good_till_date else ""
+        if order.good_till_date:
+            expiry = order.good_till_date
+            if expiry.tzinfo is not None and expiry.utcoffset() is not None:
+                native.goodTillDate = expiry.astimezone(datetime.timezone.utc).strftime("%Y%m%d %H:%M:%S UTC")
+            else:
+                native.goodTillDate = expiry.strftime("%Y%m%d %H:%M:%S")
+        else:
+            native.goodTillDate = ""
         native.outsideRth = False
         native.eTradeOnly = False
         native.firmQuoteOnly = False
@@ -1662,6 +1675,11 @@ class IBApp(IBWrapper, IBClient):
             for leg in legs[1:]:
                 leg.parentId = first_id
                 leg.transmit = leg is legs[-1]
+        child_legs = legs if order_class == OrderLum.OrderClass.OCO else legs[1:]
+        for child, leg in zip(order.child_orders, child_legs):
+            child.identifier = leg.orderId
+            if order_class != OrderLum.OrderClass.OCO:
+                child.parent_identifier = first_id
         return legs
 
     def _create_multileg_order(self, order, exchange=None, **kwargs):
@@ -1738,6 +1756,8 @@ class IBApp(IBWrapper, IBClient):
             orders = [orders]
 
         ib_orders = []
+        parents_to_track = []
+        children_to_track = []
         for order in orders:
             # Check if the order is a multileg order
             if order.order_class == OrderLum.OrderClass.MULTILEG:
@@ -1756,6 +1776,12 @@ class IBApp(IBWrapper, IBClient):
                     currency=order.quote.symbol,
                 )
                 order_objects = self.create_order(order)
+                if order.order_class != OrderLum.OrderClass.OCO:
+                    parents_to_track.append(order)
+                if order.order_class in (
+                    OrderLum.OrderClass.BRACKET, OrderLum.OrderClass.OTO, OrderLum.OrderClass.OCO,
+                ):
+                    children_to_track.extend(order.child_orders)
 
             if len(order_objects) == 0:
                 continue
@@ -1769,6 +1795,12 @@ class IBApp(IBWrapper, IBClient):
 
                 nextID = order_object.orderId if order_object.orderId else self.nextOrderId()
                 ib_orders.append((nextID, contract_object, order_object))
+
+        if self.ib_broker is not None:
+            # OCO's container shares its first peer's ID and has no native
+            # order of its own. Register only the two peers for that class.
+            for tracked in (*parents_to_track, *children_to_track):
+                self.ib_broker._unprocessed_orders.append(tracked)
 
         for ib_order in ib_orders:
             if len(ib_order) == 0:
