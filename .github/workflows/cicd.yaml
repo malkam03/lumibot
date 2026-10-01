@@ -180,6 +180,9 @@ jobs:
 
   backtest-tests:
     name: Backtest Tests (shard ${{ matrix.shard }}/4)
+    # Acceptance backtests need upstream-only data/cache secrets, so the fork
+    # integration branch skips them.
+    if: github.event_name != 'pull_request' || github.base_ref != 'malkam03-dev'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     environment: unit-tests
@@ -286,6 +289,7 @@ jobs:
           if [ "${{ needs.unit-tests.result }}" != "success" ]; then
             exit 1
           fi
-          if [ "${{ needs.backtest-tests.result }}" != "success" ]; then
+          backtest_result="${{ needs.backtest-tests.result }}"
+          if [ "$backtest_result" != "success" ] && [ "$backtest_result" != "skipped" ]; then
             exit 1
           fi
