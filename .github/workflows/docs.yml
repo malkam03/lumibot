@@ -36,7 +36,10 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pages configuration is only needed for deploys; PR builds must also
+      # pass on forks that have no Pages site.
       - name: Configure Pages
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
         uses: actions/configure-pages@v5
 
       - name: Set up Python
