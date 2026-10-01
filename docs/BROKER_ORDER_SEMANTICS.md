@@ -74,6 +74,30 @@ limit or inclusive timestamp cursor:
 
 ## Broker notes (public sources, summarized)
 
+### Legacy TWS advanced-order conversion
+
+The socket adapter uses each LumiBot `child_orders` leg's limit or stop price,
+side, and order type, rather than the parent entry's price fields. A BRACKET
+has one or two attached exits, an OTO exactly one; the parent and intermediate
+children have `transmit=False`, and the last child has `transmit=True` with
+each child referencing the parent ID. OCO instead submits exactly two OCA
+peers, both transmitted, with the same `ocaGroup` and `ocaType=1` and no
+`parentId`. Every native leg has unique integer IDs, matched quantity and
+duration, and `eTradeOnly=False`/`firmQuoteOnly=False`. The adapter rejects
+unsupported or nested children, mismatched asset/quantity/duration/side,
+and stop-limit/trailing child types; it never substitutes a plain stop.
+
+Offline regression coverage is in
+`tests/test_interactive_brokers_advanced_orders.py`. Issue
+`malkam03/lumibot#4` records separate paper evidence for one-share US stock
+DAY orders using SMART/USD and regular-hours submission. It does **not**
+qualify GTD/GTC, fractional shares, partial fills, stop-limit/trailing exits,
+or other asset types. Generated children currently default to DAY even when a
+parent has another duration: conversion explicitly rejects that mismatch
+before submission. Supply matching explicit children for a non-DAY parent.
+The upstream duration proposal `Lumiwealth/lumibot#1156` overlaps this aspect
+but is not a fix for the advanced-order graph itself.
+
 ### Bitunix futures submission contract
 
 - Cache validated `basePrecision`, `quotePrecision`, and `minTradeVolume` by

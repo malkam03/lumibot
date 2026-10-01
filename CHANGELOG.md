@@ -28,6 +28,12 @@
   class-name checks. `InteractiveBrokersTWSBacktesting` opts in.
 
 ### Fixed
+- Legacy TWS/IB Gateway BRACKET and OTO orders preserve market or limit entries
+  and convert their actual limit/stop exit children, rather than reusing entry
+  prices. OCO peers now transmit individually with a shared OCA group; cover
+  actions map to BUY. Native legs carry matching quantity/duration and disable
+  obsolete ibapi attributes. Unsupported child types and mismatched graphs
+  raise explicitly instead of submitting a different order.
 - IBKR TWS backtests now ignore the generic strategy config object unless it is an
   `IBKRTWSConfig`, preserve volumes in the units reported by TWS by default, retry sessions
   still in progress, avoid caching daily bars outside the requested sessions, and truly replace

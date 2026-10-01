@@ -1488,7 +1488,8 @@ class IBApp(IBWrapper, IBClient):
         if action.lower() in [
             OrderLum.OrderSide.BUY,
             OrderLum.OrderSide.BUY_TO_OPEN,
-            OrderLum.OrderSide.BUY_TO_CLOSE
+            OrderLum.OrderSide.BUY_TO_CLOSE,
+            OrderLum.OrderSide.BUY_TO_COVER,
             ]:
             return OrderLum.OrderSide.BUY.upper()
         elif action.lower() in [
@@ -1552,121 +1553,116 @@ class IBApp(IBWrapper, IBClient):
 
         return contract
 
+    def _convert_order_leg(self, order):
+        """Translate one LumiBot order into a native ibapi order without allocating an ID."""
+        native = Order()
+        native.action = self.get_safe_action(order.side)
+        try:
+            native.orderType = ORDERTYPE_MAPPING[order.order_type]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported TWS order type: {order.order_type}") from exc
+        native.totalQuantity = order.quantity
+        native.lmtPrice = order.limit_price if order.limit_price is not None else 0
+        native.auxPrice = order.stop_price if order.stop_price is not None else ""
+        native.trailingPercent = order.trail_percent if order.trail_percent is not None else ""
+        if order.trail_price is not None:
+            native.auxPrice = order.trail_price
+        native.tif = order.time_in_force.upper()
+        native.goodTillDate = order.good_till_date.strftime("%Y%m%d %H:%M:%S") if order.good_till_date else ""
+        native.outsideRth = False
+        native.eTradeOnly = False
+        native.firmQuoteOnly = False
+        return native
+
+    def _validate_advanced_children(self, order):
+        children = order.child_orders
+        expected = {
+            OrderLum.OrderClass.BRACKET: (1, 2),
+            OrderLum.OrderClass.OTO: (1,),
+            OrderLum.OrderClass.OCO: (2,),
+        }[order.order_class]
+        if len(children) not in expected:
+            raise ValueError(f"{order.order_class} requires {expected} child orders; got {len(children)}")
+        if len({id(child) for child in children}) != len(children):
+            raise ValueError("TWS child orders must be distinct")
+        if order.order_class == OrderLum.OrderClass.BRACKET and len(children) == 2:
+            if {child.order_type for child in children if isinstance(child, OrderLum)} != {
+                OrderLum.OrderType.LIMIT, OrderLum.OrderType.STOP,
+            }:
+                raise ValueError("TWS bracket with two children requires a limit and a stop exit")
+
+        parent_action = self.get_safe_action(order.side)
+        for child in children:
+            if not isinstance(child, OrderLum) or child.child_orders or child.order_class != OrderLum.OrderClass.SIMPLE:
+                raise ValueError("Unsupported TWS child order graph: children must be simple orders")
+            if child.asset != order.asset or child.quote != order.quote:
+                raise ValueError("TWS child asset/quote must match parent")
+            if child.quantity != order.quantity:
+                raise ValueError("TWS child quantity must match parent quantity")
+            if child.time_in_force != order.time_in_force or child.good_till_date != order.good_till_date:
+                raise ValueError("TWS child time_in_force and good_till_date must match parent")
+            action = self.get_safe_action(child.side)
+            if (
+                order.order_class == OrderLum.OrderClass.OCO and action != parent_action
+                or order.order_class != OrderLum.OrderClass.OCO and action == parent_action
+            ):
+                raise ValueError("TWS child side must close the parent or match the OCO peer side")
+            if child.order_type == OrderLum.OrderType.LIMIT:
+                valid_price = child.limit_price is not None and child.stop_price is None
+            elif child.order_type == OrderLum.OrderType.STOP:
+                valid_price = child.stop_price is not None and child.limit_price is None
+            else:
+                raise ValueError(f"Unsupported TWS child order type: {child.order_type}")
+            if not valid_price or any(
+                value is not None for value in (
+                    child.stop_limit_price, child.trail_price, child.trail_percent,
+                )
+            ):
+                raise ValueError("Unsupported TWS child price fields")
+
     def create_order(self, order):
-        ib_order = Order()
-        if order.order_class == "bracket":
-            if not order.limit_price:
-                logger.info(
-                    f"All bracket orders must have limit price for the originating "
-                    f"order. The bracket order for {order.symbol} is cancelled."
-                )
-                return []
-            parent = Order()
-            parent.orderId = order.identifier if order.identifier else self.nextOrderId()
-            parent.action = self.get_safe_action(order.side)
-            parent.orderType = "LMT"
-            parent.totalQuantity = order.quantity
-            parent.lmtPrice = order.limit_price
-            parent.transmit = False
+        order_class = order.order_class
+        if order_class not in (
+            OrderLum.OrderClass.BRACKET, OrderLum.OrderClass.OTO, OrderLum.OrderClass.OCO,
+        ):
+            native = self._convert_order_leg(order)
+            native.orderId = order.identifier if isinstance(order.identifier, int) else self.nextOrderId()
+            return [native]
 
-            takeProfit = Order()
-            takeProfit.orderId = self.nextOrderId()
-            takeProfit.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-            takeProfit.orderType = "LMT"
-            takeProfit.totalQuantity = order.quantity
-            takeProfit.lmtPrice = order.limit_price
-            takeProfit.parentId = parent.orderId
-            takeProfit.transmit = False
-
-            stopLoss = Order()
-            stopLoss.orderId = self.nextOrderId()
-            stopLoss.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-            stopLoss.orderType = "STP"
-            stopLoss.auxPrice = order.stop_price
-            stopLoss.totalQuantity = order.quantity
-            stopLoss.parentId = parent.orderId
-            stopLoss.transmit = True
-
-            bracketOrder = [parent, takeProfit, stopLoss]
-
-            return bracketOrder
-
-        elif order.order_class == "oto":
-            if not order.limit_price:
-                logger.info(
-                    f"All OTO orders must have limit price for the originating order. "
-                    f"The one triggers other order for {order.symbol} is cancelled."
-                )
-                return []
-
-            parent = Order()
-            parent.orderId = order.identifier if order.identifier else self.nextOrderId()
-            parent.action = self.get_safe_action(order.side)
-            parent.orderType = "LMT"
-            parent.totalQuantity = order.quantity
-            parent.lmtPrice = order.limit_price
-            parent.transmit = False
-
-            if order.limit_price:
-                takeProfit = Order()
-                takeProfit.orderId = self.nextOrderId()
-                takeProfit.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-                takeProfit.orderType = "LMT"
-                takeProfit.totalQuantity = order.quantity
-                takeProfit.lmtPrice = order.limit_price
-                takeProfit.parentId = parent.orderId
-                takeProfit.transmit = True
-                return [parent, takeProfit]
-
-            elif order.stop_price:
-                stopLoss = Order()
-                stopLoss.orderId = self.nextOrderId()
-                stopLoss.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-                stopLoss.orderType = "STP"
-                stopLoss.auxPrice = order.stop_price
-                stopLoss.totalQuantity = order.quantity
-                stopLoss.parentId = parent.orderId
-                stopLoss.transmit = True
-                return [parent, stopLoss]
-
-        elif order.order_class == "oco":
-            takeProfit = Order()
-            takeProfit.orderId = order.identifier if order.identifier else self.nextOrderId()
-            takeProfit.action = self.get_safe_action(order.side)
-            takeProfit.orderType = "LMT"
-            takeProfit.totalQuantity = order.quantity
-            takeProfit.lmtPrice = order.limit_price
-            takeProfit.transmit = False
-
-            oco_Group = f"oco_{takeProfit.orderId}"
-            takeProfit.ocaGroup = oco_Group
-            takeProfit.ocaType = 1
-
-            stopLoss = Order()
-            stopLoss.orderId = self.nextOrderId()
-            stopLoss.action = self.get_safe_action(order.side)
-            stopLoss.orderType = "STP"
-            stopLoss.totalQuantity = order.quantity
-            stopLoss.auxPrice = order.stop_price
-            stopLoss.transmit = True
-
-            stopLoss.ocaGroup = oco_Group
-            stopLoss.ocaType = 1
-
-            return [takeProfit, stopLoss]
+        self._validate_advanced_children(order)
+        if order_class == OrderLum.OrderClass.OCO:
+            legs = [self._convert_order_leg(child) for child in order.child_orders]
         else:
-            ib_order.action = self.get_safe_action(order.side)
-            ib_order.orderType = ORDERTYPE_MAPPING[order.order_type]
-            ib_order.totalQuantity = order.quantity
-            ib_order.lmtPrice = order.limit_price if order.limit_price else 0
-            ib_order.auxPrice = order.stop_price if order.stop_price else ""
-            ib_order.trailingPercent = order.trail_percent if order.trail_percent else ""
-            if order.trail_price:
-                ib_order.auxPrice = order.trail_price
-            ib_order.orderId = order.identifier if order.identifier else self.nextOrderId()
-            ib_order.tif = order.time_in_force.upper()
-            ib_order.goodTillDate = order.good_till_date.strftime("%Y%m%d %H:%M:%S") if order.good_till_date else ""
-            return [ib_order]
+            legs = [self._convert_order_leg(order)]
+            legs.extend(self._convert_order_leg(child) for child in order.child_orders)
+
+        first_id = (
+            order.identifier
+            if isinstance(order.identifier, int) and not isinstance(order.identifier, bool) and order.identifier > 0
+            else self.nextOrderId()
+        )
+        legs[0].orderId = first_id
+        allocated = {first_id}
+        for leg in legs[1:]:
+            next_id = self.nextOrderId()
+            if next_id < first_id:
+                raise ValueError("TWS child order ID must follow the parent ID")
+            while next_id in allocated:
+                next_id = self.nextOrderId()
+            leg.orderId = next_id
+            allocated.add(next_id)
+
+        if order_class == OrderLum.OrderClass.OCO:
+            for leg in legs:
+                leg.ocaGroup = f"oco_{first_id}"
+                leg.ocaType = 1
+                leg.transmit = True
+        else:
+            legs[0].transmit = False
+            for leg in legs[1:]:
+                leg.parentId = first_id
+                leg.transmit = leg is legs[-1]
+        return legs
 
     def _create_multileg_order(self, order, exchange=None, **kwargs):
         """Submit a list of orders as a single multileg order"""
