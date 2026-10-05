@@ -2,7 +2,7 @@
 
 Records the local fork fixes compared against canonical upstream.
 
-Last Updated: 2026-09-29
+Last Updated: 2026-10-05
 
 Status: Active
 
@@ -25,6 +25,7 @@ Canonical branch compared: `upstream/dev` (merged through `4.6.2`)
 
 | Commit | Fix | Classification | Upstream evidence | Local action | Upstream plan |
 |---|---|---|---|---|---|
+| Pending (fork issue #7) | Keep a received IBKR LAST tick ahead of the previous-close fallback, independent of arrival order. | Fork bug fix; absent from inspected upstream. | `upstream/dev` at `4280719f` still guards CLOSE with `self.tick is None`, which never records LAST receipt. | Use `tick_type_used != 4`; retain enabled close fallback when no LAST arrives. Offline snapshot tests cover both arrival orders, fallback enabled/disabled, request reset, and bid/ask preservation. | Submit through a fork PR targeting `malkam03-dev`; no upstream PR requested. |
 | `4273e288` | Preserve Yahoo intraday bar timestamps instead of stamping every intraday bar to the daily close. | Exact duplicate of an open upstream PR. | Lumiwealth/lumibot#1163 has the same author, patch, tests, and commit content. As of this record, #1163 is open and review-required, not merged. | Keep provenance clear; do not create a competing PR from this branch for the same fix. | Let #1163 merge, or coordinate with the PR author if it stalls. |
 | `146e4171` | Fetch retained Yahoo 1-minute history in seven-day windows and combine real returned bars. | Novel LumiBot adaptation for a known Yahoo/yfinance limitation. | ranaroussi/yfinance#356 documents that Yahoo retains roughly one month of 1-minute data but limits each request to seven days; ranaroussi/yfinance#959 only fixed `period="max"` to one week and does not provide LumiBot multi-window aggregation. No matching LumiBot PR was found. | Keep as an independently cherry-pickable fix with tests and docs. | Candidate for its own upstream PR or direct merge after validation and review. |
 | `9a0f8652` | Use minute-granularity timeshift for Yahoo intraday fills while preserving one-day timeshift for Yahoo daily fills. | Novel LumiBot bug fix. | No matching LumiBot issue or PR was found. `git blame` shows Yahoo fill timeshift was globally set to `-1 day`, while newer Yahoo paths can request minute data and need a minute-level fill lookup. | Add/keep a regression test that proves Yahoo minute fills request `timedelta(minutes=-1)` and day fills keep `timedelta(days=-1)`. | Candidate for its own upstream PR or direct merge after validation and review. |
