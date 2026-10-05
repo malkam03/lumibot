@@ -756,7 +756,7 @@ class IBWrapper(EWrapper):
 
         # If the last price is not available, then use yesterday's closing price
         # This can happen if the market is closed
-        if tickType == 9 and self.tick is None and self.should_use_last_close:
+        if tickType == 9 and self.tick_type_used != 4 and self.should_use_last_close:
             self.price = price
             self.tick_type_used = tickType
 
