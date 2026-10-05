@@ -19,7 +19,9 @@ Canonical upstream: `Lumiwealth/lumibot`
 
 Fork branch inspected: `malkam03-dev`
 
-Canonical branch compared: `upstream/dev` (merged through `4.6.2`)
+Canonical branch compared for fork issue #7: `upstream/dev` at `4280719f`
+(`4.6.4`, merged into `malkam03-dev` as `c4975b2c` on 2026-10-05).
+Older reconciliation rows retain their original comparison dates and evidence.
 
 ## Reconciliation Table
 
