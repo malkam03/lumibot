@@ -18,9 +18,9 @@ a guarantee of complete intraday history. This helper behavior does not enable
 intraday Yahoo backtests. No missing bars are synthesized.
 
 For a complete AI stock example, see :doc:`the bull/bear large-cap team
-<agents_example_bull_bear_large_cap_stocks>`. Yahoo daily bars cannot supply the
+<agents_example_bull_vs_bear_ai_stock_trading_bot>`. Yahoo daily bars cannot supply the
 09:30 to 09:45 evidence required by the :doc:`opening range breakout
-<agents_example_ai_opening_range_breakout>` tutorial.
+<agents_example_opening_range_breakout_ai_trading_bot>` tutorial.
 
 Using Yahoo backtester, you can also run backtests very easily on your strategies, you do not have to modify anything in your strategies.
 
@@ -80,7 +80,7 @@ Below is a table describing these optional environment variables:
      - **Description**
      - **Example**
    * - IS_BACKTESTING
-     - (Optional) Set to **"True"** to run the strategy in backtesting mode, set to **"False"** to run the strategy live (defaults to False if not set).
+     - (Optional) Available to startup code that explicitly checks it. It does not change a ``run_backtest()`` call into a broker run; see :doc:`strategy_run_modes`.
      - False
    * - BACKTESTING_START
      - (Optional) The start date for backtesting in the format "YYYY-MM-DD". Only needed if you are backtesting.
@@ -115,12 +115,13 @@ Below is an example strategy that **omits** `backtesting_start` and `backtesting
                 order = self.create_order("AAPL", quantity, "buy")
                 self.submit_order(order)
 
-    # LumiBot will automatically look for the environment variables
-    # (IS_BACKTESTING, BACKTESTING_START, BACKTESTING_END).
-    # If they are set, no other parameters are needed; if they're not set,
-    # defaults will be used (or the user can supply dates in code instead).
+    # This call always backtests. BACKTESTING_START and BACKTESTING_END
+    # can supply the dates when they are omitted here.
     result = MyStrategy.run_backtest(
         YahooDataBacktesting
     )
 
-In this example, if the variables `IS_BACKTESTING`, `BACKTESTING_START`, and `BACKTESTING_END` are set, LumiBot will pick them up automatically. If they are not set, LumiBot will simply default to other behavior (e.g., a normal run, or you can specify backtesting dates in code as shown in **Option 1**).
+This example calls ``run_backtest()`` in every case. ``BACKTESTING_START`` and
+``BACKTESTING_END`` can supply omitted dates; ``IS_BACKTESTING=false`` does not
+start broker execution. See :doc:`strategy_run_modes` for the separate broker
+runner.
