@@ -739,7 +739,19 @@ class StrategyExecutor(Thread):
                         f"and the 'new' queue never gets cleared causing duplicate orders to be added to lumibot. "
                         f"Orders: {order_lumi}"
                     )
-                    order_lumi = self.broker._clean_order_trackers(order)
+                    verified_matches = [
+                        candidate for candidate in order_lumi
+                        if self.broker._orders_match(candidate, order)
+                    ]
+                    if not verified_matches:
+                        self.strategy.logger.warning(
+                            "Conflicting broker order identity; ignoring snapshot order."
+                        )
+                        continue
+                    if len(verified_matches) > 1:
+                        order_lumi = self.broker._clean_order_trackers(order)
+                    else:
+                        order_lumi = verified_matches[0]
 
                 if order_lumi and not self.broker._orders_match(order_lumi, order):
                     self.strategy.logger.warning("Conflicting broker order identity; ignoring snapshot order.")

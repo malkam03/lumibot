@@ -19,19 +19,25 @@ Use a stable, distinct ``CLIENT_ID`` for each strategy process. The socket
 adapter only imports and reconciles orders from that API client, and rejects
 foreign-client cancellation. Numeric order IDs alone do not identify ownership.
 Parsed orders retain ``broker_client_id``, ``broker_perm_id`` and
-``broker_account``; known conflicting identities cannot overwrite local orders.
-Positions and balances still represent the selected account, not isolated
-per-strategy holdings.
+``broker_account``; known conflicting identities cannot overwrite local orders,
+and duplicate cleanup touches only verified identity matches. Parsed options
+and futures use the contract root symbol while retaining contract details such
+as expiration, strike and right. Positions and balances still represent the
+selected account, not isolated per-strategy holdings.
 
 Each order-ID allocation asks IBKR for a fresh ``nextValidId`` and stays above
 IDs already allocated by this connection. Remove downstream fixed-range
 allocator patches to use this behavior. This is not a distributed reservation:
 independent clients may still race. A confirmed duplicate-ID rejection (103)
 retries the rejected native leg once with a new number, updating tracked IDs
-and unsent parent/child links. Other rejections and a second 103 fail explicitly.
+and unsent parent/child links. Other rejections and a second 103 fail explicitly. A non-transmitting
+BRACKET/OTO leg may report ``PendingSubmit`` while it waits for the final
+transmitting child; this stages the leg and lets submission continue, but does
+not count as final acceptance. Rejections remain correlated until each leg
+receives final acceptance or rejection.
 Only documented order-specific error codes can reject a pending submission;
 unrelated request errors do not establish an order outcome. ``PendingSubmit``
-does not acknowledge acceptance; the adapter waits for ``Submitted``,
+does not acknowledge final acceptance; the adapter waits for ``Submitted``,
 ``PreSubmitted``, or ``Filled``.
 
 Submission now waits for native-leg acknowledgement. An ID reply or placement

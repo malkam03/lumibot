@@ -1988,13 +1988,14 @@ class Broker(ABC):
                 order
                 for bucket in buckets
                 for order in bucket.get_list()
-                if order.identifier == broker_order.identifier
+                if self._orders_match(order, broker_order)
             ]
             survivor = matches[0] if matches else broker_order
 
             # Keep the original strategy-owned object so decision provenance and
             # local metadata survive, while applying the broker's authoritative
             # lifecycle fields.
+            self._record_order_identity(survivor, broker_order)
             survivor.status = broker_order.status
             survivor.quantity = broker_order.quantity
             for attr in ("limit_price", "stop_price", "avg_fill_price", "error_message"):
@@ -2006,11 +2007,9 @@ class Broker(ABC):
                 survivor.update_raw(raw)
 
             for bucket in buckets:
-                while any(
-                    order.identifier == broker_order.identifier
-                    for order in bucket.get_list()
-                ):
-                    bucket.remove(broker_order.identifier, key="identifier")
+                for order in bucket.get_list():
+                    if self._orders_match(order, broker_order):
+                        bucket.remove_identity(order)
 
             if survivor.is_filled():
                 destination = self._filled_orders

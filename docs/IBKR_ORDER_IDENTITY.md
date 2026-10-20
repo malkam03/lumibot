@@ -2,7 +2,7 @@
 
 Ownership and duplicate-ID handling for independent TWS/IB Gateway clients.
 
-Last Updated: 2026-10-19
+Last Updated: 2026-10-20
 Status: Implemented; network-free regression coverage, live qualification pending
 Audience: Broker maintainers and strategy integrators
 
@@ -17,8 +17,12 @@ account-scoped; this change does not partition shared account holdings.
 Parsed orders retain `broker_client_id`, `broker_perm_id` and `broker_account`.
 Submitted parents and native children carry client/account metadata. Both broker
 and executor reconciliation use adapter identity hooks; known conflicting
-permanent IDs, accounts or assets cannot overwrite local orders. Older local
-orders lacking client metadata are treated as belonging to the configured
+permanent IDs, accounts or assets cannot overwrite local orders. Derivative
+snapshots use the submitted contract root symbol, with expiration/strike/right
+retained to distinguish contracts whose local symbols include broker-specific
+codes. Duplicate cleanup removes only entries verified against the same order
+identity, including when local objects compare equal by numeric order ID. Older
+local orders lacking client metadata are treated as belonging to the configured
 client, never as permission to adopt a foreign snapshot. Other adapters keep
 numeric/string identifier matching.
 
@@ -39,10 +43,13 @@ leg once with a fresh ID. Tracked identifiers, unsent leg identifiers and parent
 links are updated together; accepted legs are not resubmitted. Other rejection
 codes are correlated only for documented order-specific IBKR error codes; an
 unrelated request error with a numerically matching request ID does not reject
-the order. PendingSubmit is not an acceptance acknowledgement. Only Submitted,
-PreSubmitted, or Filled confirms acceptance through either openOrder or
-orderStatus. A second 103 for that leg produces an error event and raises
-`RuntimeError`. IBKR informational warnings are not rejection acknowledgements.
+the order. For non-transmitting bracket/OTO legs, `PendingSubmit` confirms that
+the leg is staged and allows the next leg to be sent, but the pending submission
+remains tracked until IBKR reports final acceptance or rejection. Only
+Submitted, PreSubmitted, or Filled confirms final acceptance through either
+openOrder or orderStatus. A second 103 for that leg produces an error event and
+raises `RuntimeError`. IBKR informational warnings are not rejection
+acknowledgements.
 
 An acknowledgement timeout raises `TimeoutError` with **unknown submission
 outcome** and does not retry: the broker might already have accepted or filled

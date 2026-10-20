@@ -2,7 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from queue import Queue
-from threading import Event
+from threading import Event, RLock
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -217,6 +217,173 @@ def test_empty_remote_metadata_does_not_erase_known_permanent_identity(broker):
     assert original.broker_perm_id == 2002
 
 
+@pytest.mark.parametrize(
+    "asset,sec_type,contract_symbol,local_symbol,last_trade_date,strike,right,multiplier",
+    [
+        (
+            Asset("BBB", asset_type=Asset.AssetType.OPTION, expiration="2026-11-20", strike=600, right="CALL"),
+            "OPT", "BBB", "BBB   261120C00600000", "20261120", 600, "C", "100",
+        ),
+        (
+            Asset("ES", asset_type=Asset.AssetType.FUTURE, expiration="2026-12-18"),
+            "FUT", "ES", "ESZ6", "20261218", 0, "", "50",
+        ),
+    ],
+)
+def test_parsed_derivative_order_matches_the_submitted_root_contract(
+    broker, asset, sec_type, contract_symbol, local_symbol, last_trade_date, strike, right, multiplier,
+):
+    remote = response()
+    remote.contract.symbol = contract_symbol
+    remote.contract.localSymbol = local_symbol
+    remote.contract.secType = sec_type
+    remote.contract.lastTradeDateOrContractMonth = last_trade_date
+    remote.contract.strike = strike
+    remote.contract.right = right
+    remote.contract.multiplier = multiplier
+    parsed = broker._parse_broker_order(remote, "example")
+    local = Order("example", asset, 11, "buy", identifier=100)
+    local.broker_client_id = 7
+    local.broker_perm_id = 2002
+
+    assert parsed.asset == asset
+    assert broker._orders_match(local, parsed)
+
+
+def test_derivative_contract_mismatch_still_rejects_order_match(broker):
+    remote = response()
+    remote.contract.symbol = "BBB"
+    remote.contract.localSymbol = "BBB   261120C00600000"
+    remote.contract.secType = "OPT"
+    remote.contract.lastTradeDateOrContractMonth = "20261120"
+    remote.contract.strike = 600
+    remote.contract.right = "C"
+    remote.contract.multiplier = "100"
+    parsed = broker._parse_broker_order(remote, "example")
+    different_contract = Order(
+        "example",
+        Asset("BBB", asset_type=Asset.AssetType.OPTION, expiration="2026-12-18", strike=600, right="CALL"),
+        11,
+        "buy",
+        identifier=100,
+    )
+    different_contract.broker_client_id = 7
+    different_contract.broker_perm_id = 2002
+
+    assert not broker._orders_match(different_contract, parsed)
+
+
+def test_duplicate_cleanup_mutates_only_verified_order_identities(broker):
+    remote = broker._parse_broker_order(response(), "example")
+    valid_first = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    valid_second = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    conflict_asset = Order("example", Asset("AAA"), 11, "buy", identifier=100)
+    conflict_perm_id = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    foreign = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    for order in (valid_first, valid_second, conflict_asset, conflict_perm_id):
+        order.broker_client_id = 7
+        order.broker_perm_id = 2002
+    conflict_perm_id.broker_perm_id = 9999
+    foreign.broker_client_id = 22
+    foreign.broker_perm_id = 2002
+    conflict_asset.status = Order.OrderStatus.FILLED
+    conflict_perm_id.status = Order.OrderStatus.CANCELED
+    foreign.status = Order.OrderStatus.FILLED
+
+    buckets = {}
+    for name in (
+        "_unprocessed_orders", "_new_orders", "_partially_filled_orders",
+        "_filled_orders", "_error_orders", "_canceled_orders", "_placeholder_orders",
+    ):
+        buckets[name] = SafeList(None)
+        setattr(broker, name, buckets[name])
+    broker._lock = RLock()
+    broker._invalidate_order_caches = Mock()
+    buckets["_unprocessed_orders"].append(foreign)
+    buckets["_new_orders"].append(valid_first)
+    buckets["_new_orders"].append(conflict_asset)
+    buckets["_filled_orders"].append(valid_second)
+    buckets["_canceled_orders"].append(conflict_perm_id)
+
+    survivor = broker._clean_order_trackers(remote)
+
+    assert survivor is valid_first
+    assert any(order is foreign for order in buckets["_unprocessed_orders"].get_list())
+    assert any(order is conflict_asset for order in buckets["_new_orders"].get_list())
+    assert any(order is conflict_perm_id for order in buckets["_canceled_orders"].get_list())
+    assert valid_second not in buckets["_filled_orders"].get_list()
+    assert conflict_asset.status == Order.OrderStatus.FILLED
+    assert conflict_perm_id.status == Order.OrderStatus.CANCELED
+    assert foreign.status == Order.OrderStatus.FILLED
+
+
+@pytest.mark.parametrize("executor_sync", [False, True])
+def test_both_sync_paths_cleanup_only_verified_duplicate_identities(broker, executor_sync):
+    remote = broker._parse_broker_order(response(), "example")
+    valid_first = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    valid_second = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    conflict_asset = Order("example", Asset("AAA"), 11, "buy", identifier=100)
+    conflict_perm_id = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    foreign = Order("example", Asset("BBB"), 11, "buy", identifier=100)
+    for order in (valid_first, valid_second, conflict_asset, conflict_perm_id):
+        order.broker_client_id = 7
+        order.broker_perm_id = 2002
+    conflict_perm_id.broker_perm_id = 9999
+    foreign.broker_client_id = 22
+    foreign.broker_perm_id = 2002
+    conflict_asset.status = Order.OrderStatus.FILLED
+    conflict_perm_id.status = Order.OrderStatus.CANCELED
+    foreign.status = Order.OrderStatus.FILLED
+
+    for name in (
+        "_unprocessed_orders", "_new_orders", "_partially_filled_orders",
+        "_filled_orders", "_error_orders", "_canceled_orders", "_placeholder_orders",
+    ):
+        setattr(broker, name, SafeList(None))
+    broker._unprocessed_orders.append(foreign)
+    broker._new_orders.append(valid_first)
+    broker._new_orders.append(conflict_asset)
+    broker._filled_orders.append(valid_second)
+    broker._canceled_orders.append(conflict_perm_id)
+    broker._lock = RLock()
+    broker._first_iteration = False
+    broker.IS_BACKTESTING_BROKER = False
+    broker._pull_all_orders = Mock(return_value=[remote])
+    broker.get_all_orders = lambda: [valid_first, valid_second, conflict_asset, conflict_perm_id, foreign]
+    broker._invalidate_order_caches = Mock()
+
+    if executor_sync:
+        broker._orders_queue = Queue()
+        broker._held_trades = []
+        broker.process_held_trades = Mock()
+        broker.sync_positions = Mock()
+        broker._get_balances_at_broker = Mock(return_value=(100, {}, 100))
+        broker._process_broker_synced_order = Mock()
+        broker._process_new_order = Mock()
+        broker._refresh_missing_active_order_from_broker = Mock()
+        executor = object.__new__(StrategyExecutor)
+        executor.broker = broker
+        executor.strategy = SimpleNamespace(
+            name="example",
+            _name="example",
+            logger=Mock(),
+            quote_asset=None,
+            _set_cash_position=Mock(),
+        )
+        executor.sync_broker()
+    else:
+        broker.sync_orders("example")
+
+    assert any(order is valid_first for order in broker._new_orders.get_list())
+    assert not any(order is valid_second for order in broker._filled_orders.get_list())
+    assert any(order is foreign for order in broker._unprocessed_orders.get_list())
+    assert any(order is conflict_asset for order in broker._new_orders.get_list())
+    assert any(order is conflict_perm_id for order in broker._canceled_orders.get_list())
+    assert conflict_asset.status == Order.OrderStatus.FILLED
+    assert conflict_perm_id.status == Order.OrderStatus.CANCELED
+    assert foreign.status == Order.OrderStatus.FILLED
+
+
 @pytest.mark.parametrize("status", [Order.OrderStatus.FILLED, Order.OrderStatus.PARTIALLY_FILLED])
 def test_fast_fill_callback_is_not_reset_to_submitted(broker, status):
     order = Order("example", Asset("BBB"), 1, "buy")
@@ -328,6 +495,168 @@ def test_pending_submit_open_order_does_not_hide_following_duplicate_rejection()
     app.error(100, 103, "synthetic duplicate order ID")
     assert pending["ready"].is_set()
     assert pending["error"][0] == 103
+
+
+def test_pending_submit_stages_bracket_until_transmitting_child_is_accepted():
+    app = app_with_ids()
+    app.client_id = 7
+    app.subaccount = None
+    app.wrapper = app
+    app.ib_broker = SimpleNamespace(
+        _unprocessed_orders=SafeList(None), _invalidate_order_caches=Mock(),
+        _process_trade_event=Mock(), ERROR_ORDER="error",
+    )
+    app.create_contract = Mock(return_value=Contract())
+    order = Order(
+        "example",
+        Asset("BBB"),
+        1,
+        "buy",
+        order_class="bracket",
+        secondary_limit_price=110,
+        secondary_stop_price=90,
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+    )
+    sent = []
+
+    def place(identifier, contract, native):
+        sent.append((identifier, contract, native))
+        if native.transmit:
+            for prior_id, prior_contract, prior_native in sent:
+                app.openOrder(
+                    prior_id, prior_contract, prior_native, SimpleNamespace(status="Submitted"),
+                )
+        else:
+            app.openOrder(identifier, contract, native, SimpleNamespace(status="PendingSubmit"))
+
+    app.placeOrder = Mock(side_effect=place)
+
+    app.execute_order(order, timeout=0.01)
+
+    assert len(sent) == 3
+    assert [native.transmit for _, _, native in sent] == [False, False, True]
+    assert app._pending_submissions == {}
+
+
+def test_rejection_after_pending_submit_prevents_sending_child_orders():
+    app = app_with_ids()
+    app.client_id = 7
+    app.subaccount = None
+    app.wrapper = app
+    app.ib_broker = SimpleNamespace(
+        _unprocessed_orders=SafeList(None), _invalidate_order_caches=Mock(),
+        _process_trade_event=Mock(), ERROR_ORDER="error",
+    )
+    app.create_contract = Mock(return_value=Contract())
+    order = Order(
+        "example",
+        Asset("BBB"),
+        1,
+        "buy",
+        order_class="bracket",
+        secondary_stop_price=90,
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+    )
+
+    def place(identifier, contract, native):
+        app.openOrder(identifier, contract, native, SimpleNamespace(status="PendingSubmit"))
+        app.error(identifier, 201, "synthetic staged-order rejection")
+
+    app.placeOrder = Mock(side_effect=place)
+
+    with pytest.raises(RuntimeError, match="rejected"):
+        app.execute_order(order, timeout=0.01)
+
+    app.placeOrder.assert_called_once()
+    assert app._pending_submissions == {}
+
+
+def test_rejection_after_staged_leg_final_status_is_not_lost():
+    app = app_with_ids()
+    app.client_id = 7
+    app.subaccount = None
+    app.wrapper = app
+    app.ib_broker = SimpleNamespace(
+        _unprocessed_orders=SafeList(None), _invalidate_order_caches=Mock(),
+        _process_trade_event=Mock(), ERROR_ORDER="error",
+    )
+    app.create_contract = Mock(return_value=Contract())
+    order = Order(
+        "example",
+        Asset("BBB"),
+        1,
+        "buy",
+        order_class="bracket",
+        secondary_stop_price=90,
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+    )
+    sent = []
+
+    def place(identifier, contract, native):
+        sent.append((identifier, contract, native))
+        if native.transmit:
+            for prior_id, prior_contract, prior_native in sent:
+                app.openOrder(
+                    prior_id, prior_contract, prior_native, SimpleNamespace(status="Submitted"),
+                )
+            app.error(sent[0][0], 201, "synthetic late staged-order rejection")
+        else:
+            app.openOrder(identifier, contract, native, SimpleNamespace(status="PendingSubmit"))
+
+    app.placeOrder = Mock(side_effect=place)
+
+    with pytest.raises(RuntimeError, match="rejected"):
+        app.execute_order(order, timeout=0.01)
+
+    assert len(sent) == 2
+    assert app._pending_submissions == {}
+
+
+def test_duplicate_id_after_staging_rekeys_bracket_before_transmission():
+    app = app_with_ids()
+    app.client_id = 7
+    app.subaccount = None
+    app.wrapper = app
+    app.ib_broker = SimpleNamespace(
+        _unprocessed_orders=SafeList(None), _invalidate_order_caches=Mock(),
+        _process_trade_event=Mock(), ERROR_ORDER="error",
+    )
+    app.create_contract = Mock(return_value=Contract())
+    order = Order(
+        "example",
+        Asset("BBB"),
+        1,
+        "buy",
+        order_class="bracket",
+        secondary_limit_price=110,
+        secondary_stop_price=90,
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+    )
+    sent = []
+
+    def place(identifier, contract, native):
+        sent.append((identifier, contract, native))
+        if len(sent) == 1:
+            app.openOrder(identifier, contract, native, SimpleNamespace(status="PendingSubmit"))
+            app.error(identifier, 103, "synthetic duplicate after staging")
+        elif native.transmit:
+            for prior_id, prior_contract, prior_native in sent[1:]:
+                app.openOrder(
+                    prior_id, prior_contract, prior_native, SimpleNamespace(status="Submitted"),
+                )
+        else:
+            app.openOrder(identifier, contract, native, SimpleNamespace(status="PendingSubmit"))
+
+    app.placeOrder = Mock(side_effect=place)
+
+    app.execute_order(order, timeout=0.01)
+
+    assert len(sent) == 4
+    assert len({identifier for identifier, _, _ in sent}) == 4
+    assert [native.transmit for _, _, native in sent] == [False, False, False, True]
+    assert all(child.parent_identifier == order.identifier for child in order.child_orders)
+    assert all(native.parentId == order.identifier for _, _, native in sent[1:] if native.parentId)
+    assert app._pending_submissions == {}
 
 
 def test_late_inactive_callback_for_duplicate_cannot_cancel_replacement(broker):
