@@ -139,6 +139,25 @@ class SafeList:
                             self.revision += 1
                             break
 
+    def remove_identity(self, value):
+        """Remove the exact object, even when another item compares equal to it."""
+        lock = self.__lock
+        if lock is None:
+            for idx, item in enumerate(self.__items):
+                if item is value:
+                    del self.__items[idx]
+                    self.revision += 1
+                    return True
+            return False
+
+        with lock:
+            for idx, item in enumerate(self.__items):
+                if item is value:
+                    del self.__items[idx]
+                    self.revision += 1
+                    return True
+        return False
+
     def extend(self, value):
         lock = self.__lock
         if lock is None:

@@ -621,6 +621,14 @@ class StrategyExecutor(Thread):
         return payload
 
     def sync_broker(self):
+        try:
+            self._sync_broker()
+        finally:
+            if not self.broker.IS_BACKTESTING_BROKER:
+                self.broker._hold_trade_events = False
+                self.broker.process_held_trades()
+
+    def _sync_broker(self):
         # Log that we are syncing the broker.
         self.strategy.logger.debug("Syncing the broker.")
 
@@ -708,15 +716,21 @@ class StrategyExecutor(Thread):
         # ORDERS
         orders_broker = self.broker._pull_all_orders(self.name, self.strategy)
         # Filter out None orders to prevent crashes
-        orders_broker = [order for order in orders_broker if order is not None]
+        orders_broker = [
+            order for order in orders_broker if order is not None and self.broker._owns_order(order)
+        ]
         if len(orders_broker) > 0 or self.broker.get_all_orders():
-            orders_lumi = self.broker.get_all_orders()
-            orders_lumi_by_identifier = self._index_orders_by_identifier(orders_lumi)
+            orders_lumi = [
+                order for order in self.broker.get_all_orders() if self.broker._owns_order(order)
+            ]
+            orders_lumi_by_identifier = self._index_orders_by_identifier(
+                orders_lumi, key=self.broker._order_sync_key
+            )
 
             # Check orders at the broker against those in lumibot.
             for order in orders_broker:
                 # Check against existing orders.
-                order_lumi = orders_lumi_by_identifier.get(order.identifier)
+                order_lumi = orders_lumi_by_identifier.get(self.broker._order_sync_key(order))
                 if isinstance(order_lumi, list):
                     self.strategy.logger.warning(
                         f"Multiple orders found in lumibot with the same identifier {order.identifier}. "
@@ -725,9 +739,26 @@ class StrategyExecutor(Thread):
                         f"and the 'new' queue never gets cleared causing duplicate orders to be added to lumibot. "
                         f"Orders: {order_lumi}"
                     )
-                    order_lumi = self.broker._clean_order_trackers(order)
+                    verified_matches = [
+                        candidate for candidate in order_lumi
+                        if self.broker._orders_match(candidate, order)
+                    ]
+                    if not verified_matches:
+                        self.strategy.logger.warning(
+                            "Conflicting broker order identity; ignoring snapshot order."
+                        )
+                        continue
+                    if len(verified_matches) > 1:
+                        order_lumi = self.broker._clean_order_trackers(order)
+                    else:
+                        order_lumi = verified_matches[0]
+
+                if order_lumi and not self.broker._orders_match(order_lumi, order):
+                    self.strategy.logger.warning("Conflicting broker order identity; ignoring snapshot order.")
+                    continue
 
                 if order_lumi:
+                    self.broker._record_order_identity(order_lumi, order)
                     # Compare the orders.
                     if not order_lumi.equivalent_status(order.status):
                         order_lumi.status = order.status
@@ -819,11 +850,14 @@ class StrategyExecutor(Thread):
                         if order.is_active():
                             self.broker._process_new_order(order)
 
-            broker_identifiers = self._get_all_order_identifiers(orders_broker)
+            broker_identifiers = {
+                self.broker._order_sync_key(candidate)
+                for order in orders_broker for candidate in [order, *order.child_orders]
+            }
             for order_lumi in orders_lumi:
                 # Remove lumibot orders if not in broker.
                 # Check both main order IDs and child order IDs from broker
-                if order_lumi.identifier not in broker_identifiers:
+                if self.broker._order_sync_key(order_lumi) not in broker_identifiers:
                     # Filled or canceled orders can be dropped by the broker as they no longer have any effect.
                     # However, active orders should not be dropped as they are still in effect and if they can't
                     # be found in the broker, they should be canceled because something went wrong.
@@ -861,14 +895,12 @@ class StrategyExecutor(Thread):
                         )
 
         self.broker._invalidate_order_caches()
-        self.broker._hold_trade_events = False
-        self.broker.process_held_trades()
 
     @staticmethod
-    def _index_orders_by_identifier(orders: list[Order]) -> dict:
+    def _index_orders_by_identifier(orders: list[Order], key=None) -> dict:
         orders_by_identifier = {}
         for order in orders:
-            identifier = order.identifier
+            identifier = key(order) if key else order.identifier
             existing = orders_by_identifier.get(identifier)
             if existing is None:
                 orders_by_identifier[identifier] = order

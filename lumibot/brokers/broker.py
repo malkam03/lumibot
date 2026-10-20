@@ -1212,6 +1212,8 @@ class Broker(ABC):
         list miss is not proof that the broker canceled the order.
         """
         log = logger_obj or getattr(self, "logger", logger)
+        if not self._owns_order(order_lumi):
+            return False
         if not order_lumi.identifier:
             log.warning(f"Active order {order_lumi} has no broker identifier; leaving it active.")
             return False
@@ -1261,11 +1263,15 @@ class Broker(ABC):
 
         candidates = [broker_order, *getattr(broker_order, "child_orders", [])]
         matched_order = next(
-            (candidate for candidate in candidates if candidate.identifier == order_lumi.identifier),
-            broker_order,
+            (candidate for candidate in candidates if self._orders_match(order_lumi, candidate)),
+            None,
         )
+        if matched_order is None:
+            log.warning("Direct broker lookup returned a different order identity; leaving local order unchanged.")
+            return False
 
         changed = False
+        self._record_order_identity(order_lumi, matched_order)
         if not order_lumi.equivalent_status(matched_order.status):
             order_lumi.status = matched_order.status
             changed = True
@@ -1287,6 +1293,21 @@ class Broker(ABC):
         )
         return changed
 
+    def _owns_order(self, order):
+        """Adapters may restrict reconciliation and lookup to their connection."""
+        return True
+
+    def _order_sync_key(self, order):
+        """Return the adapter-scoped identity used by both synchronization paths."""
+        return order.identifier
+
+    def _orders_match(self, local, remote):
+        return self._order_sync_key(local) == self._order_sync_key(remote)
+
+    def _record_order_identity(self, local, remote):
+        """Allow adapters to retain identity metadata after a verified match."""
+        pass
+
     def sync_orders(self, strategy):
         """Sync broker orders into Lumibot without promoting stale terminal history.
 
@@ -1299,13 +1320,18 @@ class Broker(ABC):
 
         strategy_name = self._strategy_name_from_input(strategy)
         orders_broker = self._pull_all_orders(strategy_name, strategy)
-        orders_broker = [order for order in orders_broker if order is not None]
+        orders_broker = [order for order in orders_broker if order is not None and self._owns_order(order)]
 
         changed = False
-        orders_lumi = self.get_all_orders()
+        orders_lumi = [order for order in self.get_all_orders() if self._owns_order(order)]
 
         for order in orders_broker:
-            matches = [ord_lumi for ord_lumi in orders_lumi if ord_lumi.identifier == order.identifier]
+            matches = [ord_lumi for ord_lumi in orders_lumi if self._orders_match(ord_lumi, order)]
+            if not matches and any(
+                self._order_sync_key(local) == self._order_sync_key(order) for local in orders_lumi
+            ):
+                logger.warning("Conflicting broker order identity; ignoring snapshot order.")
+                continue
             if len(matches) > 1:
                 logger.warning(
                     f"Multiple orders found in lumibot with the same identifier {order.identifier}. "
@@ -1316,6 +1342,7 @@ class Broker(ABC):
                 order_lumi = matches[0] if len(matches) > 0 else None
 
             if order_lumi:
+                self._record_order_identity(order_lumi, order)
                 if not order_lumi.equivalent_status(order.status):
                     order_lumi.status = order.status
                     changed = True
@@ -1334,9 +1361,12 @@ class Broker(ABC):
                 self._process_broker_synced_order(order)
                 changed = True
 
-        broker_identifiers = self._get_all_order_identifiers(orders_broker)
+        broker_identifiers = {
+            self._order_sync_key(candidate)
+            for order in orders_broker for candidate in [order, *order.child_orders]
+        }
         for order_lumi in orders_lumi:
-            if order_lumi.identifier in broker_identifiers:
+            if self._order_sync_key(order_lumi) in broker_identifiers:
                 continue
 
             if hasattr(order_lumi, '_synced_from_broker') and order_lumi._synced_from_broker:
@@ -1958,13 +1988,14 @@ class Broker(ABC):
                 order
                 for bucket in buckets
                 for order in bucket.get_list()
-                if order.identifier == broker_order.identifier
+                if self._orders_match(order, broker_order)
             ]
             survivor = matches[0] if matches else broker_order
 
             # Keep the original strategy-owned object so decision provenance and
             # local metadata survive, while applying the broker's authoritative
             # lifecycle fields.
+            self._record_order_identity(survivor, broker_order)
             survivor.status = broker_order.status
             survivor.quantity = broker_order.quantity
             for attr in ("limit_price", "stop_price", "avg_fill_price", "error_message"):
@@ -1976,11 +2007,9 @@ class Broker(ABC):
                 survivor.update_raw(raw)
 
             for bucket in buckets:
-                while any(
-                    order.identifier == broker_order.identifier
-                    for order in bucket.get_list()
-                ):
-                    bucket.remove(broker_order.identifier, key="identifier")
+                for order in bucket.get_list():
+                    if self._orders_match(order, broker_order):
+                        bucket.remove_identity(order)
 
             if survivor.is_filled():
                 destination = self._filled_orders
@@ -2554,7 +2583,7 @@ class Broker(ABC):
         if use_placeholders:
             tracked_orders.extend(self._placeholder_orders.get_list())
         for order in tracked_orders:
-            if self.identifiers_equal(order.identifier, identifier):
+            if self._owns_order(order) and self.identifiers_equal(order.identifier, identifier):
                 return order
         return None
 

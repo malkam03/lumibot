@@ -6,7 +6,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from lumibot.brokers.interactive_brokers import IBApp, InteractiveBrokers
+from lumibot.brokers.interactive_brokers import IBApp, IBWrapper, InteractiveBrokers
 from lumibot.entities import Asset, Order
 from lumibot.trading_builtins import SafeList
 
@@ -14,7 +14,12 @@ from lumibot.trading_builtins import SafeList
 @pytest.fixture
 def app():
     client = object.__new__(IBApp)
+    IBWrapper.__init__(client)
     client.nextValidOrderId = 2001
+    client.client_id = 7
+    client.subaccount = None
+    # Model a fresh broker reply, not a connection-time local counter.
+    client.reqIds = Mock(side_effect=lambda _: client.nextValidId(2001))
     return client
 
 
@@ -303,6 +308,7 @@ def test_submitted_children_are_tracked_before_native_placement(
     broker = object.__new__(InteractiveBrokers)
     broker.ib = app
     broker.subaccount = None
+    broker.client_id = app.client_id
     broker._unprocessed_orders = SafeList(None)
     broker.get_tracked_order = lambda identifier: next(
         (item for item in broker._unprocessed_orders if item.identifier == identifier), None
@@ -312,10 +318,11 @@ def test_submitted_children_are_tracked_before_native_placement(
     app.ib_broker = broker
     app.wrapper = SimpleNamespace(init_new_orders=lambda: None)
     app.create_contract = lambda *args, **kwargs: object()
-    app.placeOrder = Mock(side_effect=lambda native_id, contract, leg: (
-        broker.get_tracked_order(native_id) is not None
-        or (_ for _ in ()).throw(AssertionError("native leg placed before tracking"))
-    ))
+    def place(native_id, contract, leg):
+        assert broker.get_tracked_order(native_id) is not None
+        app._submission_response(native_id)
+
+    app.placeOrder = Mock(side_effect=place)
     order = make_order(asset, order_class=order_class, **prices)
     order.quote = Asset("USD", asset_type=Asset.AssetType.FOREX)
     for child in order.child_orders:
@@ -331,9 +338,11 @@ def test_submitted_children_are_tracked_before_native_placement(
     if order_class != "oco":
         assert all(child.parent_identifier == order.identifier for child in order.child_orders)
     for child in order.child_orders:
-        broker.on_status_event(child.identifier, "Submitted", 0, 2, 0, 0, 0, 0, 0, "", 0)
+        broker.on_status_event(child.identifier, "Submitted", 0, 2, 0, 0, 0, 0, app.client_id, "", 0)
         broker.on_trade_event(
-            0, None, SimpleNamespace(orderId=child.identifier, cumQty=2, price=95, shares=2)
+            0, None, SimpleNamespace(
+                orderId=child.identifier, clientId=app.client_id, cumQty=2, price=95, shares=2,
+            )
         )
     assert broker._process_trade_event.call_count == 2 * len(order.child_orders)
     assert [

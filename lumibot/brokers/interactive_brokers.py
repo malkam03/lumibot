@@ -7,7 +7,7 @@ from collections import deque
 from decimal import Decimal
 from functools import reduce
 from sys import exit
-from threading import Thread
+from threading import Event, Lock, Thread
 from typing import Union
 
 from dateutil import tz
@@ -235,6 +235,8 @@ class InteractiveBrokers(Broker):
     def _parse_broker_order(self, response, strategy_name, strategy_object=None):
         """Parse a broker order representation
         to an order object"""
+        if not self._owns_native_order(response):
+            return None
 
         asset_type = [k for k, v in TYPE_MAP.items() if v == response.contract.secType][0]
         totalQuantity = response.totalQuantity
@@ -272,13 +274,19 @@ class InteractiveBrokers(Broker):
 
         order._transmitted = True
         order.set_identifier(response.orderId)
+        order.broker_client_id = response.clientId
+        order.broker_perm_id = getattr(response, "permId", None)
+        order.broker_account = getattr(response, "account", None)
         order.status = response.orderState.status
         order.update_raw(response)
         return order
 
     def _parse_order_object(self, strategy_name, contract, quantity, action, limit_price = None, stop_price = None, time_in_force = None, good_till_date = None):
         asset_type = [k for k, v in TYPE_MAP.items() if v == contract.secType][0]
-        symbol = self._normalize_symbol_for_internal(contract.localSymbol, asset_type=asset_type)
+        contract_symbol = (
+            contract.symbol if contract.secType in ("OPT", "FUT") else contract.localSymbol
+        )
+        symbol = self._normalize_symbol_for_internal(contract_symbol, asset_type=asset_type)
 
         expiration = None
         multiplier = 1
@@ -290,7 +298,7 @@ class InteractiveBrokers(Broker):
             multiplier = contract.multiplier
 
         right = None
-        strike = None
+        strike = 0.0
         if contract.secType == "OPT":
             right = "CALL" if contract.right == "C" else "PUT"
             strike = contract.strike
@@ -318,14 +326,54 @@ class InteractiveBrokers(Broker):
 
     def _pull_broker_order(self, order_id):
         """Get a broker order representation by its id"""
-        pull_order = [order for order in self.ib.get_open_orders() if order.orderId == order_id]
+        pull_order = [order for order in self._pull_broker_all_orders() if order.orderId == order_id]
         response = pull_order[0] if len(pull_order) > 0 else None
         return response
 
     def _pull_broker_all_orders(self):
         """Get the broker open orders"""
         orders = self.ib.get_open_orders()
-        return orders
+        if orders is None:
+            raise TimeoutError("IBKR open-order snapshot did not complete")
+        return [order for order in orders if self._owns_native_order(order)]
+
+    def _owns_native_order(self, order):
+        return (
+            getattr(order, "clientId", None) == self.client_id
+            and (
+                not self.subaccount
+                or getattr(order, "account", getattr(order, "acctNumber", None)) == self.subaccount
+            )
+        )
+
+    def _owns_order(self, order):
+        return (
+            getattr(order, "broker_client_id", self.client_id) == self.client_id
+            and (
+                not self.subaccount
+                or getattr(order, "broker_account", None) in (None, "", self.subaccount)
+            )
+        )
+
+    def _order_sync_key(self, order):
+        return (getattr(order, "broker_client_id", self.client_id), order.identifier)
+
+    def _orders_match(self, local, remote):
+        if not self._owns_order(local) or not self._owns_order(remote):
+            return False
+        if self._order_sync_key(local) != self._order_sync_key(remote):
+            return False
+        for attr in ("broker_perm_id", "broker_account"):
+            left, right = getattr(local, attr, None), getattr(remote, attr, None)
+            if left and right and left != right:
+                return False
+        return local.asset == remote.asset
+
+    def _record_order_identity(self, local, remote):
+        for attr in ("broker_client_id", "broker_perm_id", "broker_account"):
+            value = getattr(remote, attr, None)
+            if value is not None and (attr == "broker_client_id" or value):
+                setattr(local, attr, value)
 
     def _flatten_order(self, orders): # implement for stop loss.
         """Not used for Interactive Brokers. Just returns the orders."""
@@ -354,7 +402,8 @@ class InteractiveBrokers(Broker):
     def _submit_order(self, order):
         """Submit an order for an asset"""
         # Initial order
-        order.identifier = self.ib.nextOrderId()
+        order.broker_client_id = self.client_id
+        order.broker_account = self.subaccount
         kwargs = {
             "type": order.order_type,
             "order_class": order.order_class,
@@ -383,11 +432,12 @@ class InteractiveBrokers(Broker):
         if order.order_class == OrderLum.OrderClass.MULTILEG:
             self._unprocessed_orders.append(order)
         self.ib.execute_order(order)
-        order.status = "submitted"
         return order
 
     def cancel_order(self, order):
         """Cancel an order"""
+        if not self._owns_order(order):
+            raise ValueError("Cannot cancel a foreign IBKR client order")
         self.ib.cancel_order(order)
 
     def _modify_order(self, order: OrderLum, limit_price: Union[float, None] = None,
@@ -578,6 +628,12 @@ class InteractiveBrokers(Broker):
         filled. Market orders executions  will not always trigger a Filled status.
         Therefore this must also be checked using ExecDetails
         """
+        if clientId != self.client_id:
+            return
+        if status == "Inactive" and (
+            orderId in self.ib._pending_submissions or orderId in self.ib._rejected_order_ids
+        ):
+            return
         if status in [
             "PendingSubmit",
             "PendingCancel",
@@ -609,6 +665,12 @@ class InteractiveBrokers(Broker):
         if stored_order is None:
             logger.info(f"Untracked order {orderId} was logged by broker {self.name}")
             return
+        if not self._owns_order(stored_order):
+            return
+        if permId and getattr(stored_order, "broker_perm_id", None) not in (None, 0, permId):
+            return
+        if permId:
+            stored_order.broker_perm_id = permId
 
         # Check the order status submit changes.
         if status == "Submitted":
@@ -630,12 +692,21 @@ class InteractiveBrokers(Broker):
         )
 
     def on_trade_event(self, reqId, contract, execution):
+        if not self._owns_native_order(execution):
+            return False
         orderId = execution.orderId
         stored_order = self.get_tracked_order(orderId)
 
         if stored_order is None:
             logger.info("Untracked order %s was logged by broker %s" % (orderId, self.name))
             return False
+        if not self._owns_order(stored_order):
+            return False
+        perm_id = getattr(execution, "permId", None)
+        if perm_id and getattr(stored_order, "broker_perm_id", None) not in (None, 0, perm_id):
+            return False
+        if perm_id:
+            stored_order.broker_perm_id = perm_id
             # Check the order status submit changes.
         if execution.cumQty < stored_order.quantity:
             type_event = self.PARTIALLY_FILLED_ORDER
@@ -676,6 +747,41 @@ class InteractiveBrokers(Broker):
 class IBWrapper(EWrapper):
     """Listens and collects data from IB."""
 
+    ORDER_ACK_STATUSES = frozenset({"Submitted", "PreSubmitted", "Filled"})
+    ORDER_REJECTION_CODES = frozenset({
+        103, 104, 105, 106, 107,
+        109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+        125, 126, 129, 131, 132, 133, 134, 135, 136, 137,
+        140, 141, 142, 144, 145, 146, 147, 148, 151, 152, 154, 157,
+        201, 202,
+    })
+
+    def __init__(self):
+        super().__init__()
+        self._order_id_lock = Lock()
+        self._order_id_ready = Event()
+        self._last_order_id = -1
+        self._observed_order_id = -1
+        self._submission_lock = Lock()
+        self._pending_submissions = {}
+        self._rejected_order_ids = set()
+
+    def _submission_response(self, identifier, error=None):
+        pending = self._pending_submissions.get(identifier)
+        if pending is None:
+            return
+        if error is not None:
+            pending["error"] = error
+            pending["ready"].set()
+        elif not pending["ready"].is_set():
+            pending["ready"].set()
+        pending.get("stage_or_ready", pending["ready"]).set()
+
+    def _submission_staged(self, identifier):
+        pending = self._pending_submissions.get(identifier)
+        if pending is not None and pending.get("transmit") is False:
+            pending.get("stage_or_ready", pending["ready"]).set()
+
     # Error handling code.
     def init_error(self):
         error_queue = queue.Queue()
@@ -694,6 +800,10 @@ class IBWrapper(EWrapper):
         return None
 
     def error(self, id, error_code, error_string):
+        if error_code in self.ORDER_REJECTION_CODES:
+            if error_code == 103 and id in self._pending_submissions:
+                self._rejected_order_ids.add(id)
+            self._submission_response(id, (error_code, error_string))
         if not hasattr(self, "my_errors_queue"):
             self.init_error()
 
@@ -960,14 +1070,17 @@ class IBWrapper(EWrapper):
 
         logger.debug("setting nextValidOrderId: %d", orderId)
         self.nextValidOrderId = orderId
+        self._order_id_ready.set()
 
-    def nextOrderId(self):
-        while not hasattr(self, "nextValidOrderId"):
-            print("Waiting for next order id")
-            time.sleep(0.1)
-        oid = self.nextValidOrderId
-        self.nextValidOrderId += 1
-        return oid
+    def nextOrderId(self, timeout=10):
+        with self._order_id_lock:
+            self._order_id_ready.clear()
+            self.reqIds(-1)
+            if not self._order_id_ready.wait(timeout):
+                raise TimeoutError("Timed out waiting for IBKR nextValidId")
+            oid = max(self.nextValidOrderId, self._last_order_id + 1, self._observed_order_id + 1)
+            self._last_order_id = oid
+            return oid
 
     def init_orders(self):
         self.orders = list()
@@ -981,6 +1094,12 @@ class IBWrapper(EWrapper):
         return new_orders_queue
 
     def openOrder(self, orderId: OrderId, contract: Contract, order: Order, orderState: OrderState):
+        self._observed_order_id = max(self._observed_order_id, orderId)
+        if order.clientId == self.client_id:
+            if orderState.status in self.ORDER_ACK_STATUSES:
+                self._submission_response(orderId)
+            elif orderState.status == "PendingSubmit":
+                self._submission_staged(orderId)
         if not hasattr(self, "orders"):
             self.init_orders()
         openOrdertxt = (
@@ -1003,6 +1122,7 @@ class IBWrapper(EWrapper):
 
         logger.debug(openOrdertxt)
 
+        order.orderId = orderId
         order.contract = contract
         order.orderState = orderState
         self.orders.append(order)
@@ -1031,6 +1151,12 @@ class IBWrapper(EWrapper):
         whyHeld,
         mktCapPrice,
     ):
+        self._observed_order_id = max(self._observed_order_id, orderId)
+        if clientId == self.client_id:
+            if status in self.ORDER_ACK_STATUSES:
+                self._submission_response(orderId)
+            elif status == "PendingSubmit":
+                self._submission_staged(orderId)
         orderStatustxt = (
             f"orderStatus - "
             f"orderid: {orderId}, "
@@ -1055,6 +1181,8 @@ class IBWrapper(EWrapper):
         )
 
     def execDetails(self, reqId, contract, execution):
+        if execution.clientId == self.client_id:
+            self._submission_response(execution.orderId)
         execDetailstxt = (
             f"execDetails - "
             f"{reqId}, "
@@ -1382,6 +1510,11 @@ class IBClient(EClient):
         return requested_orders
 
     def cancel_order(self, order):
+        if (
+            getattr(order, "broker_client_id", self.client_id) != self.client_id
+            or self.subaccount and getattr(order, "broker_account", None) not in (None, "", self.subaccount)
+        ):
+            raise ValueError("Cannot cancel a foreign IBKR client order")
         order_id = order.identifier
         if not order_id or not isinstance(order_id, int):
             logger.info(
@@ -1704,7 +1837,7 @@ class IBApp(IBWrapper, IBClient):
         combo_contract.currency = order.child_orders[0].quote.symbol  # Assuming all child orders have the same currency
 
         # Create a new order ID for the combo order
-        combo_order_id = self.nextOrderId()
+        combo_order_id = order.identifier
 
         # Initialize the combo legs
         combo_contract.comboLegs = []
@@ -1748,20 +1881,56 @@ class IBApp(IBWrapper, IBClient):
         # Return the combo contract and order
         return combo_contract, combo_order
 
-    def execute_order(self, orders):
+    def execute_order(self, orders, timeout=10):
+        # Only the submitting thread waits; callbacks must keep the reader thread free.
+        with self._submission_lock:
+            return self._execute_order(orders, timeout)
+
+    def _record_submission_rejection(self, identifier, tracked_orders, rejection):
+        if self.ib_broker is not None:
+            rejected = next(
+                item for item in tracked_orders if item.identifier == identifier
+                and item.order_class != OrderLum.OrderClass.OCO
+            )
+            self.ib_broker._process_trade_event(
+                rejected, self.ib_broker.ERROR_ORDER, error=rejection,
+            )
+
+    def _reassign_order_ids(self, ib_orders, start_index, tracked_orders, timeout):
+        replacements = {
+            old_id: self.nextOrderId(timeout=timeout)
+            for old_id, _, _ in ib_orders[start_index:]
+        }
+        for tracked in tracked_orders:
+            tracked.identifier = replacements.get(tracked.identifier, tracked.identifier)
+            tracked.parent_identifier = replacements.get(
+                tracked.parent_identifier, tracked.parent_identifier
+            )
+        for leg_index in range(start_index, len(ib_orders)):
+            old_id, leg_contract, leg = ib_orders[leg_index]
+            leg.orderId = replacements[old_id]
+            leg.parentId = replacements.get(leg.parentId, leg.parentId)
+            ib_orders[leg_index] = (leg.orderId, leg_contract, leg)
+        if self.ib_broker is not None:
+            self.ib_broker._invalidate_order_caches()
+
+    def _execute_order(self, orders, timeout):
         # Create a queue to store the new order.
         self.wrapper.init_new_orders()
 
         if not isinstance(orders, list):
             orders = [orders]
-
         ib_orders = []
         parents_to_track = []
         children_to_track = []
         for order in orders:
+            order.identifier = self.nextOrderId(timeout=timeout)
+            order.broker_client_id = self.client_id
+            order.broker_account = self.subaccount
             # Check if the order is a multileg order
             if order.order_class == OrderLum.OrderClass.MULTILEG:
                 contract_object, order_object = self._create_multileg_order(order)
+                order.identifier = order_object.orderId
 
                 order_objects = [order_object]
 
@@ -1776,6 +1945,7 @@ class IBApp(IBWrapper, IBClient):
                     currency=order.quote.symbol,
                 )
                 order_objects = self.create_order(order)
+                order.identifier = order_objects[0].orderId
                 if order.order_class != OrderLum.OrderClass.OCO:
                     parents_to_track.append(order)
                 if order.order_class in (
@@ -1800,10 +1970,113 @@ class IBApp(IBWrapper, IBClient):
             # OCO's container shares its first peer's ID and has no native
             # order of its own. Register only the two peers for that class.
             for tracked in (*parents_to_track, *children_to_track):
+                tracked.broker_client_id = self.client_id
+                tracked.broker_account = self.subaccount
                 self.ib_broker._unprocessed_orders.append(tracked)
 
-        for ib_order in ib_orders:
-            if len(ib_order) == 0:
-                continue
+        tracked_orders = list({id(item): item for item in [
+            *orders, *parents_to_track, *children_to_track,
+        ]}.values())
+        pending_ids = []
+        pending_indices = {}
+        retried_indices = set()
+        index = 0
+        try:
+            while index < len(ib_orders):
+                delayed_rejection = next(
+                    (
+                        identifier
+                        for identifier in pending_ids
+                        if pending_indices[identifier] < index
+                        and self._pending_submissions[identifier]["error"] is not None
+                    ),
+                    None,
+                )
+                if delayed_rejection is not None:
+                    failed_index = pending_indices[delayed_rejection]
+                    error = self._pending_submissions[delayed_rejection]["error"]
+                    if error[0] == 103 and failed_index not in retried_indices:
+                        retried_indices.add(failed_index)
+                        for old_id in list(pending_ids):
+                            if pending_indices[old_id] >= failed_index:
+                                self._pending_submissions.pop(old_id, None)
+                                pending_ids.remove(old_id)
+                                pending_indices.pop(old_id, None)
+                        try:
+                            self._reassign_order_ids(
+                                ib_orders, failed_index, tracked_orders, timeout,
+                            )
+                        except TimeoutError as exc:
+                            self._record_submission_rejection(
+                                delayed_rejection, tracked_orders, exc,
+                            )
+                            raise
+                        index = failed_index
+                        continue
+                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
+                    self._record_submission_rejection(delayed_rejection, tracked_orders, rejection)
+                    raise rejection
 
-            self.placeOrder(*ib_order)
+                identifier, contract, native = ib_orders[index]
+                for tracked in tracked_orders:
+                    if tracked.identifier == identifier:
+                        tracked.status = "submitted"
+
+                native.clientId = self.client_id
+                if self.subaccount:
+                    native.account = self.subaccount
+                pending = {
+                    "ready": Event(),
+                    "stage_or_ready": Event(),
+                    "error": None,
+                    "transmit": native.transmit,
+                }
+                self._pending_submissions[identifier] = pending
+                pending_ids.append(identifier)
+                pending_indices[identifier] = index
+                self.placeOrder(identifier, contract, native)
+                wait_for = pending["ready"] if native.transmit else pending["stage_or_ready"]
+                if not wait_for.wait(timeout):
+                    raise TimeoutError(
+                        "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
+                    )
+
+                error = pending["error"]
+                if error is not None:
+                    if error[0] == 103 and index not in retried_indices:
+                        retried_indices.add(index)
+                        for old_id in list(pending_ids):
+                            if pending_indices[old_id] >= index:
+                                self._pending_submissions.pop(old_id, None)
+                                pending_ids.remove(old_id)
+                                pending_indices.pop(old_id, None)
+                        logger.warning("IBKR duplicate order ID rejected; retrying once with a fresh ID")
+                        try:
+                            self._reassign_order_ids(ib_orders, index, tracked_orders, timeout)
+                        except TimeoutError as exc:
+                            self._record_submission_rejection(identifier, tracked_orders, exc)
+                            raise
+                        continue
+                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
+                    self._record_submission_rejection(identifier, tracked_orders, rejection)
+                    raise rejection
+                index += 1
+
+            # Staged legs remain pending until the transmitting leg causes IBKR
+            # to report final acceptance or a rejection for each order.
+            for identifier in pending_ids:
+                pending = self._pending_submissions[identifier]
+                if not pending["ready"].wait(timeout):
+                    raise TimeoutError(
+                        "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
+                    )
+            for identifier in pending_ids:
+                pending = self._pending_submissions[identifier]
+                if pending["error"] is not None:
+                    error = pending["error"]
+                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
+                    self._record_submission_rejection(identifier, tracked_orders, rejection)
+                    raise rejection
+        finally:
+            for identifier in pending_ids:
+                self._pending_submissions.pop(identifier, None)
