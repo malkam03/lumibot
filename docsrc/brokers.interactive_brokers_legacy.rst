@@ -54,8 +54,13 @@ importable from ``lumibot.brokers.interactive_brokers``. It exposes
 * ``REJECTED``: IBKR positively rejected the graph and no leg is live.
 * ``PARTIAL``: some legs were rejected while others were accepted; reconcile
   the accepted legs.
-* ``UNKNOWN``: at least one leg was not confirmed within the timeout. This is
+* ``UNKNOWN``: at least one leg was not confirmed within the timeout, including
+  silent staged legs after the transmitting leg was sent and rejected. This is
   raised as ``IBKROrderSubmissionUnknown``, which is also a ``TimeoutError``.
+
+For OCO orders the error covers the whole call: if the second peer fails after
+the first was accepted, the outcome is ``PARTIAL`` (or ``UNKNOWN``) and
+``legs`` includes the live first peer.
 
 An unknown outcome is not a rejection and is never retried automatically:
 reconcile orders at IBKR before submitting again. A rejected parent does not by

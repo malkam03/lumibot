@@ -1994,16 +1994,15 @@ class IBApp(IBWrapper, IBClient):
         # transmits them, so only the transmitting leg is awaited first.
         transmit_id = ib_orders[end][0]
         transmit_state = "not_sent"
-        if placed_end == end:
+        transmit_sent = placed_end == end
+        if transmit_sent:
             transmit = self._pending_submissions[transmit_id]
             transmit["ready"].wait(max(0, deadline - time.monotonic()))
             ready, error = self._submission_snapshot(transmit_id)
             if not ready:
                 transmit_state = "unknown"
-            elif error is not None:
-                transmit_state = "rejected"
             else:
-                transmit_state = "accepted"
+                transmit_state = "rejected" if error is not None else "accepted"
                 for leg_index in range(start, end + 1):
                     self._pending_submissions[ib_orders[leg_index][0]]["ready"].wait(
                         max(0, deadline - time.monotonic())
@@ -2021,7 +2020,9 @@ class IBApp(IBWrapper, IBClient):
                 code, message = snapshot[1]
             elif snapshot[0]:
                 outcome = IBKRSubmissionLeg.ACCEPTED
-            elif transmit_state in ("accepted", "unknown"):
+            elif transmit_sent:
+                # Once the transmitting leg was sent, a rejection of that leg
+                # alone does not prove a silent staged leg never became live.
                 outcome = IBKRSubmissionLeg.UNKNOWN
             else:
                 outcome = IBKRSubmissionLeg.NOT_TRANSMITTED
@@ -2067,7 +2068,7 @@ class IBApp(IBWrapper, IBClient):
             rejected = [i for i, leg in enumerate(legs) if leg.outcome == IBKRSubmissionLeg.REJECTED]
 
             if not rejected and all(o == IBKRSubmissionLeg.ACCEPTED for o in outcomes):
-                return
+                return legs
             if IBKRSubmissionLeg.UNKNOWN in outcomes or transmit_state == "unknown":
                 raise self._submission_error(legs, IBKROrderSubmissionError.UNKNOWN)
 
@@ -2175,6 +2176,7 @@ class IBApp(IBWrapper, IBClient):
             *orders, *parents_to_track, *children_to_track,
         ]}.values())
         pending_ids = []
+        accepted_legs = []
         index = 0
         try:
             while index < len(ib_orders):
@@ -2185,7 +2187,23 @@ class IBApp(IBWrapper, IBClient):
                     ),
                     len(ib_orders) - 1,
                 )
-                self._submit_graph(ib_orders, index, group_end, tracked_orders, timeout, pending_ids)
+                try:
+                    accepted_legs.extend(self._submit_graph(
+                        ib_orders, index, group_end, tracked_orders, timeout, pending_ids,
+                    ))
+                except IBKROrderSubmissionError as exc:
+                    if not accepted_legs:
+                        raise
+                    # Earlier graphs of this call (e.g. an OCO peer) are already
+                    # live, so the call as a whole is never a clean rejection.
+                    outcome = (
+                        IBKROrderSubmissionError.UNKNOWN
+                        if exc.outcome == IBKROrderSubmissionError.UNKNOWN
+                        else IBKROrderSubmissionError.PARTIAL
+                    )
+                    raise self._submission_error(
+                        (*accepted_legs, *exc.legs), outcome,
+                    ) from exc
                 index = group_end + 1
         finally:
             for identifier in pending_ids:

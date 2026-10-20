@@ -981,11 +981,13 @@ def test_transmitting_leg_duplicate_rekeys_only_that_leg_and_keeps_parent_link()
     def place(identifier, contract, native):
         sent.append((identifier, native.parentId, native.transmit))
         if native.transmit and len(sent) == 3:
+            # Earlier legs are explicitly live, so only the transmitting leg is
+            # provably absent and may be rekeyed.
+            accept(app, sent[0][0])
+            accept(app, sent[1][0])
             app.error(identifier, 103, "synthetic duplicate order id")
         elif native.transmit:
-            for leg_id, _, _ in sent:
-                if leg_id != sent[2][0]:
-                    accept(app, leg_id)
+            accept(app, identifier)
 
     app.placeOrder = Mock(side_effect=place)
     app.execute_order(order, timeout=0.05)
@@ -996,28 +998,76 @@ def test_transmitting_leg_duplicate_rekeys_only_that_leg_and_keeps_parent_link()
     assert sent[3][2] is True
 
 
-def test_non_duplicate_transmit_rejection_is_typed_rejected_for_whole_graph():
-    from lumibot.brokers.interactive_brokers import IBKROrderSubmissionError
+@pytest.mark.parametrize("code", [201, 103, 110])
+def test_transmit_rejection_with_silent_staged_legs_is_unknown_not_retried(code):
+    """A rejected transmitting leg does not prove silent staged legs never went
+    live, so the outcome stays UNKNOWN: no 103 retry and no error events."""
+    from lumibot.brokers.interactive_brokers import IBKROrderSubmissionUnknown
 
     app = graph_app()
     order = graph_order()
+    app.reqIds = Mock(side_effect=lambda _: app.nextValidId(100 + app.reqIds.call_count))
 
     def place(identifier, contract, native):
         if native.transmit:
-            app.error(identifier, 201, "synthetic margin rejection")
+            app.error(identifier, code, "synthetic transmit rejection")
 
     app.placeOrder = Mock(side_effect=place)
-    with pytest.raises(IBKROrderSubmissionError, match=r"rejected \(201\)") as caught:
+    with pytest.raises(IBKROrderSubmissionUnknown) as caught:
         app.execute_order(order, timeout=0.05)
 
     exc = caught.value
-    assert exc.outcome == "rejected"
-    assert exc.positively_rejected
-    assert [leg.outcome for leg in exc.legs] == ["not_transmitted", "not_transmitted", "rejected"]
-    assert exc.legs[2].code == 201
+    assert exc.outcome == "unknown"
+    assert not exc.positively_rejected
+    assert [leg.outcome for leg in exc.legs] == ["unknown", "unknown", "rejected"]
+    assert (exc.legs[2].code, exc.code) == (code, code)
+    assert list(exc.order_ids) == [order.identifier, *[c.identifier for c in order.child_orders]]
     assert app.placeOrder.call_count == 3
-    recorded = {id(call.args[0]) for call in app.ib_broker._process_trade_event.call_args_list}
-    assert recorded == {id(order), *[id(child) for child in order.child_orders]}
+    app.ib_broker._process_trade_event.assert_not_called()
+
+
+def oco_order():
+    return Order(
+        "example", Asset("BBB"), 1, "sell", order_class="oco", limit_price=117, stop_price=83,
+        quote=Asset("USD", asset_type=Asset.AssetType.FOREX),
+    )
+
+
+@pytest.mark.parametrize("second", ["reject", "silent"])
+def test_oco_second_peer_failure_keeps_live_first_peer_in_outcome(second):
+    """An accepted earlier OCO peer makes the call PARTIAL or UNKNOWN, never REJECTED."""
+    from lumibot.brokers.interactive_brokers import (
+        IBKROrderSubmissionError,
+        IBKROrderSubmissionUnknown,
+    )
+
+    app = graph_app()
+    order = oco_order()
+    sent = []
+
+    def place(identifier, contract, native):
+        sent.append(identifier)
+        if len(sent) == 1:
+            accept(app, identifier)
+        elif second == "reject":
+            app.error(identifier, 201, "synthetic margin rejection")
+
+    app.placeOrder = Mock(side_effect=place)
+    with pytest.raises(IBKROrderSubmissionError) as caught:
+        app.execute_order(order, timeout=0.05)
+
+    exc = caught.value
+    assert list(exc.order_ids) == sent
+    assert not exc.positively_rejected
+    if second == "reject":
+        assert exc.outcome == "partial"
+        assert [leg.outcome for leg in exc.legs] == ["accepted", "rejected"]
+        recorded = [call.args[0] for call in app.ib_broker._process_trade_event.call_args_list]
+        assert [tracked.identifier for tracked in recorded] == [sent[1]]
+    else:
+        assert isinstance(exc, IBKROrderSubmissionUnknown)
+        assert [leg.outcome for leg in exc.legs] == ["accepted", "unknown"]
+        app.ib_broker._process_trade_event.assert_not_called()
 
 
 def test_parent_duplicate_reported_before_children_are_sent_rekeys_whole_graph():

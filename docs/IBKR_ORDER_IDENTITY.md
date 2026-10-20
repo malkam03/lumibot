@@ -54,8 +54,11 @@ informational warnings are not acknowledgements. A leg is classified as:
 
 - accepted, rejected (with code/message), or
 - not transmitted: a staged leg without callbacks when the transmitting leg was
-  rejected or never sent, or
-- unknown: unconfirmed while the transmitting leg was accepted or unconfirmed.
+  never sent (placement stopped after an earlier rejection), or
+- unknown: any other unconfirmed leg. Once the transmitting leg was sent, a
+  silent staged leg stays unknown even if the transmitting leg itself was
+  rejected, because that rejection does not prove the parent or earlier
+  siblings never went live.
 
 Graph outcome: all accepted succeeds; any unknown leg raises
 `IBKROrderSubmissionUnknown` (also `TimeoutError`); rejections with any
@@ -65,6 +68,12 @@ graph. All are `IBKROrderSubmissionError` (`RuntimeError`) exposing client ID,
 account, raw code/message and per-leg `IBKRSubmissionLeg` outcomes. A parent
 rejection alone never implies the children are absent.
 
+A call that submits several graphs (OCO peers) reports the whole call: if a
+later graph fails after an earlier graph was accepted, the raised error
+includes the accepted legs and is PARTIAL (or UNKNOWN when the failing graph is
+unknown), chained from the per-graph error. It is never REJECTED while an
+earlier peer is live.
+
 Error 103 retries at most once per graph, only if the first rejected leg's
 code is 103, the transmitting leg is rejected or unsent, and no leg at or after
 the rejected leg was accepted. Legs from the rejected one onward are rekeyed
@@ -72,8 +81,9 @@ together, with parent links and tracked identifiers remapped; earlier staged
 legs keep their IDs. A failed fresh-ID request during the retry raises
 REJECTED chained from the `TimeoutError`. Staged legs are never cancelled.
 A rejection reported for an early leg stops placement before the transmitting
-leg is sent. Known residual race: a parent 103 arriving after the transmitting
-leg was sent, while children stay silent, yields UNKNOWN (fail-closed).
+leg is sent. Once the transmitting leg was sent, a 103 retry happens only if
+every leg was explicitly answered; any rejection with silent staged legs
+yields UNKNOWN (fail-closed, no retry).
 
 An unknown outcome does not retry: the broker might already have accepted or
 filled the order. Reconcile against IBKR before taking further action.
