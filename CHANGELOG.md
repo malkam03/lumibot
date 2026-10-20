@@ -19,6 +19,7 @@ Deploy marker: `8bbc892f818c3760f79303a2be769f69906ecaa6`
   bars directly from a user-run IB Gateway or TWS, with minute and day support.
 
 ### Fixed
+- IBKR socket order snapshots, lookups, callbacks and synchronization enforce API-client ownership and retain permanent/account identity. Order IDs are refreshed from IBKR per allocation; confirmed duplicate-ID rejections retry once, while unknown submission outcomes fail without a blind retry.
 - IBKR minute history repairs missing cached sessions when Parquet timestamps use microsecond, millisecond, or second resolution. Cache and calendar timestamps now use consistent units before gap and market-hours searches, so open sessions are not mistaken for closed intervals on pandas 3.
 - IBKR live market-data snapshots keep a received LAST price when a previous-close tick arrives later, and use the previous close only when no LAST tick was received and fallback is enabled.
 - TWS/IB Gateway BRACKET, OTO, and OCO orders preserve configured entry and exit types, prices, and child-order links; unsupported child graphs fail explicitly.
