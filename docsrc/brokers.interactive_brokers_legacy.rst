@@ -28,24 +28,45 @@ selected account, not isolated per-strategy holdings.
 Each order-ID allocation asks IBKR for a fresh ``nextValidId`` and stays above
 IDs already allocated by this connection. Remove downstream fixed-range
 allocator patches to use this behavior. This is not a distributed reservation:
-independent clients may still race. A confirmed duplicate-ID rejection (103)
-retries the rejected native leg once with a new number, updating tracked IDs
-and unsent parent/child links. Other rejections and a second 103 fail explicitly. A non-transmitting
-BRACKET/OTO leg may report ``PendingSubmit`` while it waits for the final
-transmitting child; this stages the leg and lets submission continue, but does
-not count as final acceptance. Rejections remain correlated until each leg
-receives final acceptance or rejection.
-Only documented order-specific error codes can reject a pending submission;
-unrelated request errors do not establish an order outcome. ``PendingSubmit``
-does not acknowledge final acceptance; the adapter waits for ``Submitted``,
-``PreSubmitted``, or ``Filled``.
+independent clients may still race.
 
-Submission now waits for native-leg acknowledgement. An ID reply or placement
-acknowledgement missing for 10 seconds raises ``TimeoutError``. A placement
-timeout means **unknown outcome**, not rejection, and is never automatically
-retried. Reconcile orders at IBKR before submitting again. If an advanced order
-stops partway through, inspect already accepted/staged legs rather than blindly
-resubmitting the entire graph. Public strategy signatures are unchanged.
+BRACKET/OTO legs form one order graph: the parent and earlier children are
+sent with ``transmit=False`` and the last child transmits the whole graph.
+IBKR usually sends no callback for a staged leg, so the adapter sends every
+leg of the graph without waiting on staged legs, then waits up to 10 seconds
+for the graph as a whole. Only ``Submitted``, ``PreSubmitted`` or ``Filled``
+confirms acceptance; ``PendingSubmit`` does not. Only documented
+order-specific error codes can reject a pending submission; unrelated request
+errors do not establish an order outcome.
+
+A duplicate-ID rejection (103) is retried once with fresh numbers, and only
+when no leg at or after the rejected leg can be live at IBKR. Tracked IDs and
+parent/child links are updated together. Other rejections, a second 103 and
+any uncertain graph fail without a retry. Staged legs are never cancelled.
+
+Failed submissions raise ``IBKROrderSubmissionError`` (a ``RuntimeError``),
+importable from ``lumibot.brokers.interactive_brokers``. It exposes
+``outcome``, ``client_id``, ``account``, ``code``, ``error_message``,
+``order_ids``, ``parent_order_id`` and per-leg ``legs``
+(``IBKRSubmissionLeg`` with ``order_id``, ``parent_id``, ``transmit``,
+``outcome``, ``code`` and ``message``). The outcome is:
+
+* ``REJECTED``: IBKR positively rejected the graph and no leg is live.
+* ``PARTIAL``: some legs were rejected while others were accepted; reconcile
+  the accepted legs.
+* ``UNKNOWN``: at least one leg was not confirmed within the timeout, including
+  silent staged legs after the transmitting leg was sent and rejected. This is
+  raised as ``IBKROrderSubmissionUnknown``, which is also a ``TimeoutError``.
+
+For OCO orders the error covers the whole call: if the second peer fails after
+the first was accepted, the outcome is ``PARTIAL`` (or ``UNKNOWN``) and
+``legs`` includes the live first peer.
+
+An unknown outcome is not a rejection and is never retried automatically:
+reconcile orders at IBKR before submitting again. A rejected parent does not by
+itself prove the children are absent; check the per-leg outcomes. A missing
+order-ID reply before anything is sent still raises ``TimeoutError``. Public
+strategy signatures are unchanged.
 
 Native advanced orders
 ----------------------
