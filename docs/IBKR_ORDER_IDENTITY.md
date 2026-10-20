@@ -37,26 +37,47 @@ A missing reply raises
 fixed client-specific ranges and no new environment variables.
 
 `IBApp.execute_order(orders, timeout=10)` serializes submissions within one
-connection. Native legs are tracked before placement and wait for an open-order,
-status or execution acknowledgement. A confirmed error 103 retries that native
-leg once with a fresh ID. Tracked identifiers, unsent leg identifiers and parent
-links are updated together; accepted legs are not resubmitted. Other rejection
-codes are correlated only for documented order-specific IBKR error codes; an
-unrelated request error with a numerically matching request ID does not reject
-the order. For non-transmitting bracket/OTO legs, `PendingSubmit` confirms that
-the leg is staged and allows the next leg to be sent, but the pending submission
-remains tracked until IBKR reports final acceptance or rejection. Only
-Submitted, PreSubmitted, or Filled confirms final acceptance through either
-openOrder or orderStatus. A second 103 for that leg produces an error event and
-raises `RuntimeError`. IBKR informational warnings are not rejection
-acknowledgements.
+connection. Native legs are split into graphs, each ending at a `transmit=True`
+leg (a bracket/OTO is one graph; OCO peers, simple and multileg orders are
+single-leg graphs). Every leg of a graph is tracked and placed back-to-back,
+then one shared deadline covers the whole graph. Staged `transmit=False` legs
+are not waited on individually: IB Gateway normally sends no callback for them
+until the transmitting leg arrives. PR #10 waited on each staged parent for
+`PendingSubmit`, which live Gateways do not send, so every native bracket timed
+out before its children were placed (unknown outcome, never transmitted).
 
-An acknowledgement timeout raises `TimeoutError` with **unknown submission
-outcome** and does not retry: the broker might already have accepted or filled
-the order. Reconcile against IBKR before taking further action. If a multi-leg
-submission stops partway through, inspect already accepted/staged legs and
-reconcile them; do not blindly replay the graph. Terminal callback status is
-not reset to submitted on return from placement.
+Only Submitted, PreSubmitted or Filled (openOrder, orderStatus or execution)
+confirms acceptance; `PendingSubmit` is ignored. Rejections are correlated only
+for documented order-specific IBKR error codes; an unrelated request error
+with a numerically matching request ID does not reject the order, and IBKR
+informational warnings are not acknowledgements. A leg is classified as:
+
+- accepted, rejected (with code/message), or
+- not transmitted: a staged leg without callbacks when the transmitting leg was
+  rejected or never sent, or
+- unknown: unconfirmed while the transmitting leg was accepted or unconfirmed.
+
+Graph outcome: all accepted succeeds; any unknown leg raises
+`IBKROrderSubmissionUnknown` (also `TimeoutError`); rejections with any
+accepted leg raise PARTIAL; otherwise REJECTED. Error events are recorded only
+for rejected legs of a PARTIAL graph, and for every tracked leg of a REJECTED
+graph. All are `IBKROrderSubmissionError` (`RuntimeError`) exposing client ID,
+account, raw code/message and per-leg `IBKRSubmissionLeg` outcomes. A parent
+rejection alone never implies the children are absent.
+
+Error 103 retries at most once per graph, only if the first rejected leg's
+code is 103, the transmitting leg is rejected or unsent, and no leg at or after
+the rejected leg was accepted. Legs from the rejected one onward are rekeyed
+together, with parent links and tracked identifiers remapped; earlier staged
+legs keep their IDs. A failed fresh-ID request during the retry raises
+REJECTED chained from the `TimeoutError`. Staged legs are never cancelled.
+A rejection reported for an early leg stops placement before the transmitting
+leg is sent. Known residual race: a parent 103 arriving after the transmitting
+leg was sent, while children stay silent, yields UNKNOWN (fail-closed).
+
+An unknown outcome does not retry: the broker might already have accepted or
+filled the order. Reconcile against IBKR before taking further action.
+Terminal callback status is not reset to submitted on return from placement.
 
 `reqIds` is not a distributed reservation or lock across processes. A fresh
 reply reduces stale allocations but cannot guarantee collision-free placement
@@ -76,5 +97,14 @@ Offline coverage lives in `tests/test_ibkr_order_identity.py` and
 `tests/test_interactive_brokers_advanced_orders.py`. It covers foreign orders with
 equal/different IDs, terminal preservation, partial-fill callbacks, both sync
 paths, metadata conflicts, concurrent allocation, missing replies, bounded
-rejection retries and bracket parent/child rekeying. These tests establish
+rejection retries, bracket parent/child rekeying, staged graph legs without
+callbacks, delayed/missing/partial graph acknowledgement and typed errors.
+These tests establish
 adapter behavior, not live multi-client Gateway qualification.
+
+For rollout qualification of an installed package (no test tree, no socket,
+no orders), run `python scripts/ibkr_staged_bracket_smoke.py` with the target
+interpreter. A fake gateway keeps staged legs silent and acknowledges the graph
+only after its transmitting leg; the script checks leg IDs, transmit flags,
+parent links, client identity and typed UNKNOWN on a missing acknowledgement.
+It exits non-zero on failure (including when the typed API is absent).

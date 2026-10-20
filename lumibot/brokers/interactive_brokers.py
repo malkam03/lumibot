@@ -4,6 +4,7 @@ import os
 import random
 import time
 from collections import deque
+from dataclasses import dataclass
 from decimal import Decimal
 from functools import reduce
 from sys import exit
@@ -744,6 +745,66 @@ class InteractiveBrokers(Broker):
 
 # ===================INTERACTIVE BROKERS CLASSES===================
 
+@dataclass(frozen=True)
+class IBKRSubmissionLeg:
+    """Outcome of one native leg in an IBKR submission attempt."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+    NOT_TRANSMITTED = "not_transmitted"
+
+    order_id: int
+    parent_id: int
+    transmit: bool
+    outcome: str
+    code: Union[int, None] = None
+    message: Union[str, None] = None
+
+
+class IBKROrderSubmissionError(RuntimeError):
+    """IBKR did not accept a whole submission graph.
+
+    ``legs`` describes only the current attempt, after any duplicate-ID refresh.
+    ``outcome`` is ``rejected`` only when no leg can be live at IBKR, ``partial``
+    when some legs were accepted and others rejected, and ``unknown`` when any
+    transmitted leg is still unconfirmed.
+    """
+
+    REJECTED = "rejected"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+    def __init__(self, message, *, outcome, client_id, account, legs):
+        super().__init__(message)
+        self.outcome = outcome
+        self.client_id = client_id
+        self.account = account
+        self.legs = tuple(legs)
+        first = next((leg for leg in self.legs if leg.code is not None), None)
+        self.code = first.code if first else None
+        self.error_message = first.message if first else None
+
+    @property
+    def order_ids(self):
+        return tuple(leg.order_id for leg in self.legs)
+
+    @property
+    def parent_order_id(self):
+        return self.legs[0].order_id if self.legs else None
+
+    @property
+    def positively_rejected(self):
+        return self.outcome == self.REJECTED
+
+
+class IBKROrderSubmissionUnknown(IBKROrderSubmissionError, TimeoutError):
+    """No final IBKR acknowledgement arrived; the graph may be live."""
+
+    def __init__(self, message, **kwargs):
+        super().__init__(message, outcome=self.UNKNOWN, **kwargs)
+
+
 class IBWrapper(EWrapper):
     """Listens and collects data from IB."""
 
@@ -764,23 +825,27 @@ class IBWrapper(EWrapper):
         self._observed_order_id = -1
         self._submission_lock = Lock()
         self._pending_submissions = {}
+        self._submission_state_lock = Lock()
         self._rejected_order_ids = set()
 
     def _submission_response(self, identifier, error=None):
-        pending = self._pending_submissions.get(identifier)
-        if pending is None:
-            return
-        if error is not None:
-            pending["error"] = error
+        # Callbacks run on the IB reader thread; the state lock keeps a
+        # rejection and its readiness flag atomic for _submission_snapshot.
+        with self._submission_state_lock:
+            pending = self._pending_submissions.get(identifier)
+            if pending is None:
+                return
+            if error is not None:
+                pending["error"] = error
             pending["ready"].set()
-        elif not pending["ready"].is_set():
-            pending["ready"].set()
-        pending.get("stage_or_ready", pending["ready"]).set()
 
-    def _submission_staged(self, identifier):
-        pending = self._pending_submissions.get(identifier)
-        if pending is not None and pending.get("transmit") is False:
-            pending.get("stage_or_ready", pending["ready"]).set()
+    def _submission_snapshot(self, identifier):
+        """Return ``(ready, error)`` for a pending submission as one consistent read."""
+        with self._submission_state_lock:
+            pending = self._pending_submissions.get(identifier)
+            if pending is None:
+                return None
+            return pending["ready"].is_set(), pending["error"]
 
     # Error handling code.
     def init_error(self):
@@ -1098,8 +1163,6 @@ class IBWrapper(EWrapper):
         if order.clientId == self.client_id:
             if orderState.status in self.ORDER_ACK_STATUSES:
                 self._submission_response(orderId)
-            elif orderState.status == "PendingSubmit":
-                self._submission_staged(orderId)
         if not hasattr(self, "orders"):
             self.init_orders()
         openOrdertxt = (
@@ -1155,8 +1218,6 @@ class IBWrapper(EWrapper):
         if clientId == self.client_id:
             if status in self.ORDER_ACK_STATUSES:
                 self._submission_response(orderId)
-            elif status == "PendingSubmit":
-                self._submission_staged(orderId)
         orderStatustxt = (
             f"orderStatus - "
             f"orderid: {orderId}, "
@@ -1886,15 +1947,15 @@ class IBApp(IBWrapper, IBClient):
         with self._submission_lock:
             return self._execute_order(orders, timeout)
 
-    def _record_submission_rejection(self, identifier, tracked_orders, rejection):
-        if self.ib_broker is not None:
-            rejected = next(
-                item for item in tracked_orders if item.identifier == identifier
-                and item.order_class != OrderLum.OrderClass.OCO
-            )
-            self.ib_broker._process_trade_event(
-                rejected, self.ib_broker.ERROR_ORDER, error=rejection,
-            )
+    def _record_submission_rejection(self, identifiers, tracked_orders, rejection):
+        if self.ib_broker is None:
+            return
+        for tracked in tracked_orders:
+            # OCO's container shares its first peer's ID; only the peer is a broker order.
+            if tracked.identifier in identifiers and tracked.order_class != OrderLum.OrderClass.OCO:
+                self.ib_broker._process_trade_event(
+                    tracked, self.ib_broker.ERROR_ORDER, error=rejection,
+                )
 
     def _reassign_order_ids(self, ib_orders, start_index, tracked_orders, timeout):
         replacements = {
@@ -1913,6 +1974,142 @@ class IBApp(IBWrapper, IBClient):
             ib_orders[leg_index] = (leg.orderId, leg_contract, leg)
         if self.ib_broker is not None:
             self.ib_broker._invalidate_order_caches()
+
+    def _place_submission_leg(self, ib_orders, leg_index, tracked_orders, pending_ids):
+        identifier, contract, native = ib_orders[leg_index]
+        for tracked in tracked_orders:
+            if tracked.identifier == identifier:
+                tracked.status = "submitted"
+        native.clientId = self.client_id
+        if self.subaccount:
+            native.account = self.subaccount
+        self._pending_submissions[identifier] = {
+            "ready": Event(), "error": None, "transmit": native.transmit,
+        }
+        pending_ids.append(identifier)
+        self.placeOrder(identifier, contract, native)
+
+    def _graph_leg_outcomes(self, ib_orders, start, end, placed_end, deadline):
+        # IBKR stays silent for transmit=False legs until the graph's last leg
+        # transmits them, so only the transmitting leg is awaited first.
+        transmit_id = ib_orders[end][0]
+        transmit_state = "not_sent"
+        if placed_end == end:
+            transmit = self._pending_submissions[transmit_id]
+            transmit["ready"].wait(max(0, deadline - time.monotonic()))
+            ready, error = self._submission_snapshot(transmit_id)
+            if not ready:
+                transmit_state = "unknown"
+            elif error is not None:
+                transmit_state = "rejected"
+            else:
+                transmit_state = "accepted"
+                for leg_index in range(start, end + 1):
+                    self._pending_submissions[ib_orders[leg_index][0]]["ready"].wait(
+                        max(0, deadline - time.monotonic())
+                    )
+
+        legs = []
+        for leg_index in range(start, end + 1):
+            identifier, _, native = ib_orders[leg_index]
+            snapshot = self._submission_snapshot(identifier) if leg_index <= placed_end else None
+            code = message = None
+            if snapshot is None:
+                outcome = IBKRSubmissionLeg.NOT_TRANSMITTED
+            elif snapshot[1] is not None:
+                outcome = IBKRSubmissionLeg.REJECTED
+                code, message = snapshot[1]
+            elif snapshot[0]:
+                outcome = IBKRSubmissionLeg.ACCEPTED
+            elif transmit_state in ("accepted", "unknown"):
+                outcome = IBKRSubmissionLeg.UNKNOWN
+            else:
+                outcome = IBKRSubmissionLeg.NOT_TRANSMITTED
+            legs.append(IBKRSubmissionLeg(
+                identifier, native.parentId, native.transmit, outcome, code, message,
+            ))
+        return legs, transmit_state
+
+    def _submission_error(self, legs, outcome):
+        if outcome == IBKROrderSubmissionError.UNKNOWN:
+            message = "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
+            return IBKROrderSubmissionUnknown(
+                message, client_id=self.client_id, account=self.subaccount, legs=legs,
+            )
+        first = next(leg for leg in legs if leg.code is not None)
+        message = f"IBKR order rejected ({first.code}): {first.message}"
+        if outcome == IBKROrderSubmissionError.PARTIAL:
+            message += "; other legs of the order graph were accepted"
+        return IBKROrderSubmissionError(
+            message, outcome=outcome, client_id=self.client_id, account=self.subaccount, legs=legs,
+        )
+
+    def _submit_graph(self, ib_orders, start, end, tracked_orders, timeout, pending_ids):
+        """Place one parent/child graph whose last leg transmits the earlier legs."""
+        place_from = start
+        retried = False
+        while True:
+            placed_end = place_from - 1
+            for leg_index in range(place_from, end + 1):
+                # Never transmit a graph after any earlier leg was already rejected.
+                if any(
+                    self._pending_submissions[ib_orders[prior][0]]["error"] is not None
+                    for prior in range(start, leg_index)
+                ):
+                    break
+                self._place_submission_leg(ib_orders, leg_index, tracked_orders, pending_ids)
+                placed_end = leg_index
+            deadline = time.monotonic() + timeout
+            legs, transmit_state = self._graph_leg_outcomes(
+                ib_orders, start, end, placed_end, deadline,
+            )
+            outcomes = [leg.outcome for leg in legs]
+            rejected = [i for i, leg in enumerate(legs) if leg.outcome == IBKRSubmissionLeg.REJECTED]
+
+            if not rejected and all(o == IBKRSubmissionLeg.ACCEPTED for o in outcomes):
+                return
+            if IBKRSubmissionLeg.UNKNOWN in outcomes or transmit_state == "unknown":
+                raise self._submission_error(legs, IBKROrderSubmissionError.UNKNOWN)
+
+            first = rejected[0]
+            # A duplicate ID is retried only when nothing from that leg onward
+            # can be live: the graph was not transmitted and no later leg was accepted.
+            if (
+                not retried
+                and legs[first].code == 103
+                and transmit_state in ("rejected", "not_sent")
+                and IBKRSubmissionLeg.ACCEPTED not in outcomes[first:]
+            ):
+                retried = True
+                retry_index = start + first
+                logger.warning("IBKR duplicate order ID rejected; retrying once with fresh IDs")
+                for leg_index in range(retry_index, end + 1):
+                    old_id = ib_orders[leg_index][0]
+                    self._pending_submissions.pop(old_id, None)
+                    if old_id in pending_ids:
+                        pending_ids.remove(old_id)
+                try:
+                    self._reassign_order_ids(ib_orders, retry_index, tracked_orders, timeout)
+                except TimeoutError as exc:
+                    self._raise_graph_rejection(legs, tracked_orders, exc)
+                place_from = retry_index
+                continue
+
+            self._raise_graph_rejection(legs, tracked_orders)
+
+    def _raise_graph_rejection(self, legs, tracked_orders, cause=None):
+        # Accepted legs stay live, so a graph with any accepted leg is PARTIAL
+        # and only its rejected legs receive error events.
+        if any(leg.outcome == IBKRSubmissionLeg.ACCEPTED for leg in legs):
+            error = self._submission_error(legs, IBKROrderSubmissionError.PARTIAL)
+            identifiers = {leg.order_id for leg in legs if leg.outcome == IBKRSubmissionLeg.REJECTED}
+        else:
+            error = self._submission_error(legs, IBKROrderSubmissionError.REJECTED)
+            identifiers = {leg.order_id for leg in legs}
+        self._record_submission_rejection(identifiers, tracked_orders, error)
+        if cause is not None:
+            raise error from cause
+        raise error
 
     def _execute_order(self, orders, timeout):
         # Create a queue to store the new order.
@@ -1978,105 +2175,18 @@ class IBApp(IBWrapper, IBClient):
             *orders, *parents_to_track, *children_to_track,
         ]}.values())
         pending_ids = []
-        pending_indices = {}
-        retried_indices = set()
         index = 0
         try:
             while index < len(ib_orders):
-                delayed_rejection = next(
+                group_end = next(
                     (
-                        identifier
-                        for identifier in pending_ids
-                        if pending_indices[identifier] < index
-                        and self._pending_submissions[identifier]["error"] is not None
+                        leg_index for leg_index in range(index, len(ib_orders))
+                        if ib_orders[leg_index][2].transmit
                     ),
-                    None,
+                    len(ib_orders) - 1,
                 )
-                if delayed_rejection is not None:
-                    failed_index = pending_indices[delayed_rejection]
-                    error = self._pending_submissions[delayed_rejection]["error"]
-                    if error[0] == 103 and failed_index not in retried_indices:
-                        retried_indices.add(failed_index)
-                        for old_id in list(pending_ids):
-                            if pending_indices[old_id] >= failed_index:
-                                self._pending_submissions.pop(old_id, None)
-                                pending_ids.remove(old_id)
-                                pending_indices.pop(old_id, None)
-                        try:
-                            self._reassign_order_ids(
-                                ib_orders, failed_index, tracked_orders, timeout,
-                            )
-                        except TimeoutError as exc:
-                            self._record_submission_rejection(
-                                delayed_rejection, tracked_orders, exc,
-                            )
-                            raise
-                        index = failed_index
-                        continue
-                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
-                    self._record_submission_rejection(delayed_rejection, tracked_orders, rejection)
-                    raise rejection
-
-                identifier, contract, native = ib_orders[index]
-                for tracked in tracked_orders:
-                    if tracked.identifier == identifier:
-                        tracked.status = "submitted"
-
-                native.clientId = self.client_id
-                if self.subaccount:
-                    native.account = self.subaccount
-                pending = {
-                    "ready": Event(),
-                    "stage_or_ready": Event(),
-                    "error": None,
-                    "transmit": native.transmit,
-                }
-                self._pending_submissions[identifier] = pending
-                pending_ids.append(identifier)
-                pending_indices[identifier] = index
-                self.placeOrder(identifier, contract, native)
-                wait_for = pending["ready"] if native.transmit else pending["stage_or_ready"]
-                if not wait_for.wait(timeout):
-                    raise TimeoutError(
-                        "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
-                    )
-
-                error = pending["error"]
-                if error is not None:
-                    if error[0] == 103 and index not in retried_indices:
-                        retried_indices.add(index)
-                        for old_id in list(pending_ids):
-                            if pending_indices[old_id] >= index:
-                                self._pending_submissions.pop(old_id, None)
-                                pending_ids.remove(old_id)
-                                pending_indices.pop(old_id, None)
-                        logger.warning("IBKR duplicate order ID rejected; retrying once with a fresh ID")
-                        try:
-                            self._reassign_order_ids(ib_orders, index, tracked_orders, timeout)
-                        except TimeoutError as exc:
-                            self._record_submission_rejection(identifier, tracked_orders, exc)
-                            raise
-                        continue
-                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
-                    self._record_submission_rejection(identifier, tracked_orders, rejection)
-                    raise rejection
-                index += 1
-
-            # Staged legs remain pending until the transmitting leg causes IBKR
-            # to report final acceptance or a rejection for each order.
-            for identifier in pending_ids:
-                pending = self._pending_submissions[identifier]
-                if not pending["ready"].wait(timeout):
-                    raise TimeoutError(
-                        "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
-                    )
-            for identifier in pending_ids:
-                pending = self._pending_submissions[identifier]
-                if pending["error"] is not None:
-                    error = pending["error"]
-                    rejection = RuntimeError(f"IBKR order rejected ({error[0]}): {error[1]}")
-                    self._record_submission_rejection(identifier, tracked_orders, rejection)
-                    raise rejection
+                self._submit_graph(ib_orders, index, group_end, tracked_orders, timeout, pending_ids)
+                index = group_end + 1
         finally:
             for identifier in pending_ids:
                 self._pending_submissions.pop(identifier, None)
