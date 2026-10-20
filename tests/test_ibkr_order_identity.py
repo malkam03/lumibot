@@ -282,6 +282,54 @@ def test_informational_warning_does_not_reject_submission():
     assert not app._pending_submissions[100]["ready"].is_set()
 
 
+def test_non_order_request_error_does_not_reject_matching_pending_order_id():
+    app = app_with_ids()
+    app._pending_submissions[100] = {"ready": Event(), "error": None}
+    app.error(100, 200, "synthetic contract-details request error")
+    assert not app._pending_submissions[100]["ready"].is_set()
+    assert app._pending_submissions[100]["error"] is None
+
+
+def test_non_order_error_leaves_submission_outcome_unknown_without_retry():
+    app = app_with_ids()
+    app.client_id = 7
+    app.subaccount = None
+    app.wrapper = app
+    app.ib_broker = None
+    app.create_contract = Mock(return_value=Contract())
+    app.placeOrder = Mock(side_effect=lambda identifier, *_: app.error(
+        identifier, 200, "synthetic contract-details request error",
+    ))
+    order = Order("example", Asset("BBB"), 1, "buy", quote=Asset("USD", asset_type="forex"))
+    with pytest.raises(TimeoutError, match="unknown; not retrying"):
+        app.execute_order(order, timeout=0.01)
+    app.placeOrder.assert_called_once()
+
+
+@pytest.mark.parametrize("error_code", [103, 201, 202])
+def test_documented_order_error_codes_reject_pending_submissions(error_code):
+    app = app_with_ids()
+    pending = {"ready": Event(), "error": None}
+    app._pending_submissions[100] = pending
+    app.error(100, error_code, "synthetic order rejection")
+    assert pending["ready"].is_set()
+    assert pending["error"][0] == error_code
+
+
+def test_pending_submit_open_order_does_not_hide_following_duplicate_rejection():
+    app = app_with_ids()
+    app.client_id = 7
+    pending = {"ready": Event(), "error": None}
+    app._pending_submissions[100] = pending
+    native = NativeOrder()
+    native.clientId = 7
+    app.openOrder(100, Contract(), native, SimpleNamespace(status="PendingSubmit"))
+    assert not pending["ready"].is_set()
+    app.error(100, 103, "synthetic duplicate order ID")
+    assert pending["ready"].is_set()
+    assert pending["error"][0] == 103
+
+
 def test_late_inactive_callback_for_duplicate_cannot_cancel_replacement(broker):
     app = app_with_ids()
     broker.ib = app

@@ -744,6 +744,15 @@ class InteractiveBrokers(Broker):
 class IBWrapper(EWrapper):
     """Listens and collects data from IB."""
 
+    ORDER_ACK_STATUSES = frozenset({"Submitted", "PreSubmitted", "Filled"})
+    ORDER_REJECTION_CODES = frozenset({
+        103, 104, 105, 106, 107,
+        109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+        125, 126, 129, 131, 132, 133, 134, 135, 136, 137,
+        140, 141, 142, 144, 145, 146, 147, 148, 151, 152, 154, 157,
+        201, 202,
+    })
+
     def __init__(self):
         super().__init__()
         self._order_id_lock = Lock()
@@ -778,9 +787,9 @@ class IBWrapper(EWrapper):
         return None
 
     def error(self, id, error_code, error_string):
-        if error_code == 103 and id in self._pending_submissions:
-            self._rejected_order_ids.add(id)
-        if error_code != 399 and not 2100 <= error_code < 2200:
+        if error_code in self.ORDER_REJECTION_CODES:
+            if error_code == 103 and id in self._pending_submissions:
+                self._rejected_order_ids.add(id)
             self._submission_response(id, (error_code, error_string))
         if not hasattr(self, "my_errors_queue"):
             self.init_error()
@@ -1073,7 +1082,7 @@ class IBWrapper(EWrapper):
 
     def openOrder(self, orderId: OrderId, contract: Contract, order: Order, orderState: OrderState):
         self._observed_order_id = max(self._observed_order_id, orderId)
-        if order.clientId == self.client_id and orderState.status != "Inactive":
+        if order.clientId == self.client_id and orderState.status in self.ORDER_ACK_STATUSES:
             self._submission_response(orderId)
         if not hasattr(self, "orders"):
             self.init_orders()
@@ -1127,7 +1136,7 @@ class IBWrapper(EWrapper):
         mktCapPrice,
     ):
         self._observed_order_id = max(self._observed_order_id, orderId)
-        if clientId == self.client_id and status in ("Submitted", "PreSubmitted", "Filled"):
+        if clientId == self.client_id and status in self.ORDER_ACK_STATUSES:
             self._submission_response(orderId)
         orderStatustxt = (
             f"orderStatus - "

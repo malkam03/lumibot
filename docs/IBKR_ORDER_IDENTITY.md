@@ -37,7 +37,11 @@ connection. Native legs are tracked before placement and wait for an open-order,
 status or execution acknowledgement. A confirmed error 103 retries that native
 leg once with a fresh ID. Tracked identifiers, unsent leg identifiers and parent
 links are updated together; accepted legs are not resubmitted. Other rejection
-codes, or a second 103 for that leg, produce an error event and raise
+codes are correlated only for documented order-specific IBKR error codes; an
+unrelated request error with a numerically matching request ID does not reject
+the order. PendingSubmit is not an acceptance acknowledgement. Only Submitted,
+PreSubmitted, or Filled confirms acceptance through either openOrder or
+orderStatus. A second 103 for that leg produces an error event and raises
 `RuntimeError`. IBKR informational warnings are not rejection acknowledgements.
 
 An acknowledgement timeout raises `TimeoutError` with **unknown submission
