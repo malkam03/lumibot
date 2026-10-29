@@ -36,7 +36,10 @@ changes quantity or reconstructs parent/transmit/OCA/account fields. A request
 already satisfied by the fresh snapshot returns without sending.
 
 Only a matching `openOrder` callback with `Submitted` or `PreSubmitted` state,
-requested prices and matching identity/topology confirms a change. A generic
+requested prices and matching identity/topology confirms a change. A
+permanent-ID mismatch cannot acknowledge a request. Snapshot uniqueness is
+scoped to the connected client as well as the numeric order ID, so another
+client's same-numbered order cannot shadow the owned order. A generic
 `orderStatus("Submitted")`, an old-price callback or an informational warning
 does not. Snapshot calls and modifications are serialized per connection, while
 callback delivery uses a separate lock. Blocking modification from the socket
@@ -57,6 +60,18 @@ reset. After manual reconciliation, a newly established connection can be used
 for a deliberate next action; reconnecting alone is **not** reconciliation.
 The existing generic Strategy inactive-order short circuit still returns `None`;
 callers requiring acknowledgement must check `result is order`.
+
+The built-in SmartLimit executor recognizes the exception's
+`requires_reconciliation` marker and sets the order's serialized
+`modification_requires_reconciliation` latch. It retains the previous local
+price and blocks subsequent repricing, cancellation/replacement and final-hold
+cancellation, including after an order serialization round trip. It logs the
+unknown outcome once instead of silently abandoning the ladder. Run-once
+execution remains unresolved and reaches its bounded drain failure rather
+than reporting a clean completion. The latch must not be cleared until broker
+orders, executions and positions have been explicitly reconciled; there is no
+automatic recovery. Other brokers' existing modification/fallback behavior is
+unchanged.
 
 IBKR has no modification-request ID/sequence in `openOrder`. Matching broker
 state is the confirmation evidence, not proof of exchange execution or a fill
@@ -100,6 +115,9 @@ open order, rechecks exposure before sending, requires fresh real-time bid/ask,
 caps the order at one share and $1,000 notional, and refuses closed sessions or
 the final 15 minutes (including early closes). Other sessions must not trade
 the selected symbol during the probe; the API cannot atomically reserve it.
+Candidate and broker symbols are canonicalized for every exposure check and
+final position reconciliation, including lowercase/whitespace and class-share
+aliases; the selected contract uses IBKR's native symbol convention.
 
 It submits a tagged native limit BUY plus a transmitted protective STOP_LIMIT
 child, waits for entry execution and child acknowledgement, then calls the real

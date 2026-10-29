@@ -21,6 +21,7 @@ from ibapi.order import Order as NativeOrder
 from lumibot.brokers.interactive_brokers import IBApp, IBClient, IBWrapper, InteractiveBrokers
 from lumibot.entities import Asset, Order
 from lumibot.strategies.strategy import Strategy
+from lumibot.tools.symbol_normalization import normalize_symbol_for_internal, normalize_symbol_for_broker
 
 
 def require_paper_account(accounts):
@@ -49,11 +50,17 @@ def unused_symbol(symbols, positions, orders):
     """Exclude any symbol exposed or ordered in any visible account/client."""
     if positions is None or orders is None:
         raise RuntimeError("Complete broker positions and orders are required.")
-    blocked = {position["symbol"] for position in positions if position["position"] != 0}
-    blocked.update(order.contract.symbol for order in orders)
+    blocked = {
+        normalize_symbol_for_internal(position["symbol"])
+        for position in positions if position["position"] != 0
+    }
+    blocked.update(normalize_symbol_for_internal(order.contract.symbol) for order in orders)
     for symbol in symbols:
-        if symbol not in blocked:
-            return symbol
+        canonical = normalize_symbol_for_internal(symbol)
+        if not isinstance(canonical, str) or not canonical:
+            raise ValueError("Probe candidates must be nonempty stock symbols.")
+        if canonical not in blocked:
+            return canonical
     raise RuntimeError("No candidate has zero existing exposure and zero open orders.")
 
 
@@ -107,7 +114,8 @@ def run_probe(app, symbols, timeout=15, max_notional=1000):
         native.eTradeOnly = False
         native.firmQuoteOnly = False
     contract = Contract()
-    contract.symbol, contract.secType, contract.exchange, contract.currency = symbol, "STK", "SMART", "USD"
+    contract.symbol = normalize_symbol_for_broker(symbol, "ibkr", "stock")
+    contract.secType, contract.exchange, contract.currency = "STK", "SMART", "USD"
     print(f"Paper verified; submitting tagged one-share OTO: {symbol}, parent={parent_id}, stop={child_id}", flush=True)
     # Do not use create_order(): this intentionally builds the exact native OTO
     # STOP_LIMIT topology, then exercises Strategy.modify_order on that child.
@@ -159,7 +167,10 @@ def run_probe(app, symbols, timeout=15, max_notional=1000):
         positions, orders = app.get_positions(), app.get_open_orders()
         if positions is None or orders is None:
             raise RuntimeError("Final broker reconciliation unavailable.")
-        flat = not any(p["symbol"] == symbol and p["position"] != 0 for p in positions)
+        flat = not any(
+            normalize_symbol_for_internal(p["symbol"]) == symbol and p["position"] != 0
+            for p in positions
+        )
         remaining = any(native.orderId in {parent_id, child_id} or native.orderRef == tag for native in orders)
         return flat and not remaining
 
@@ -230,7 +241,8 @@ class PaperProbeApp(IBApp):
         self._quote_ready.clear()
         self._quote_id = self.get_reqid()
         contract = Contract()
-        contract.symbol, contract.secType, contract.exchange, contract.currency = symbol, "STK", "SMART", "USD"
+        contract.symbol = normalize_symbol_for_broker(symbol, "ibkr", "stock")
+        contract.secType, contract.exchange, contract.currency = "STK", "SMART", "USD"
         self.reqMarketDataType(1)
         self.reqMktData(self._quote_id, contract, "", False, False, [])
         try:

@@ -66,6 +66,8 @@ class IBOrderModificationRejected(RuntimeError):
 class IBOrderModificationUnknown(TimeoutError):
     """The modification may have reached IBKR; reconcile before taking action."""
 
+    requires_reconciliation = True
+
     def __init__(self, order_id):
         self.order_id = order_id
         super().__init__(
@@ -1249,7 +1251,7 @@ class IBWrapper(EWrapper):
             if pending is not None and pending.outcome == "pending":
                 expected = pending.expected
                 fields = (
-                    "clientId", "parentId", "transmit", "orderType", "action",
+                    "clientId", "permId", "parentId", "transmit", "orderType", "action",
                     "totalQuantity", "lmtPrice", "auxPrice", "tif", "account",
                 )
                 if orderState.status in {"Submitted", "PreSubmitted"} and all(
@@ -1691,7 +1693,10 @@ class IBClient(EClient):
             orders = self.get_open_orders()
             if orders is None:
                 raise ConnectionError("IBKR open-order snapshot unavailable; modification was not sent.")
-            matches = [native for native in orders if native.orderId == order_id]
+            matches = [
+                native for native in orders
+                if native.orderId == order_id and native.clientId == self.client_id
+            ]
             if len(matches) != 1:
                 raise ValueError("IBKR order is absent or ambiguous in the open-order snapshot.")
             original = matches[0]

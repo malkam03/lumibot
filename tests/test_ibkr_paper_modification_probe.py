@@ -100,6 +100,29 @@ def test_symbol_selection_avoids_any_existing_exposure_or_order():
         probe.unused_symbol(["SPY"], None, [])
 
 
+@pytest.mark.parametrize("candidate,exposed", [("spy", "SPY"), (" spy ", "SPY"), ("brk/b", "BRK B")])
+def test_symbol_aliases_cannot_bypass_existing_exposure(candidate, exposed):
+    with pytest.raises(RuntimeError):
+        probe.unused_symbol([candidate], [{"symbol": exposed, "position": 1}], [])
+    with pytest.raises(RuntimeError):
+        probe.unused_symbol([candidate], [], [SimpleNamespace(contract=SimpleNamespace(symbol=exposed))])
+
+
+def test_lowercase_probe_is_canonical_through_submission_and_reconciliation(monkeypatch):
+    monkeypatch.setattr(probe, "require_trading_window", lambda: None)
+    result = probe.run_probe(OfflinePaper(), [" spy "], timeout=0.01)
+    assert result["symbol"] == "SPY" and result["flat"] is True
+
+
+def test_final_reconciliation_cannot_miss_differently_cased_exposure(monkeypatch):
+    monkeypatch.setattr(probe, "require_trading_window", lambda: None)
+    app = OfflinePaper()
+    original = app.get_positions
+    app.get_positions = lambda: [{"symbol": "spy", "position": 1}] if app.filled(51) else original()
+    with pytest.raises(TimeoutError):
+        probe.run_probe(app, ["spy"], timeout=0.001)
+
+
 @pytest.mark.parametrize("now", [
     dt.datetime(2026, 10, 29, 19, 50, tzinfo=dt.timezone.utc),
     dt.datetime(2026, 10, 31, 16, tzinfo=dt.timezone.utc),

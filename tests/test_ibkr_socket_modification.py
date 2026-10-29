@@ -157,7 +157,7 @@ def test_unknown_never_changes_prices_and_blocks_blind_retry(socket_order, respo
 
 
 @pytest.mark.parametrize("field,value", [
-    ("clientId", 18), ("parentId", 99), ("transmit", False), ("totalQuantity", 2),
+    ("clientId", 18), ("permId", 999), ("parentId", 99), ("transmit", False), ("totalQuantity", 2),
     ("orderType", "STP"), ("action", "BUY"), ("account", "different-account"),
 ])
 def test_mismatched_callback_cannot_acknowledge(socket_order, field, value):
@@ -201,6 +201,98 @@ def test_foreign_or_unsupported_native_order_is_not_adopted(socket_order, field,
     with pytest.raises(ValueError):
         broker.modify_order(order, stop_price=92)
     app.placeOrder.assert_not_called()
+
+
+def test_same_numeric_id_on_foreign_client_does_not_hide_owned_order(socket_order):
+    app, broker, order, native = socket_order
+    foreign = deepcopy(native)
+    foreign.clientId = 18
+    app.get_open_orders.return_value = [foreign, native]
+    app.placeOrder.side_effect = lambda _, contract, updated: acknowledge(app, updated)
+    assert broker.modify_order(order, stop_price=92) is order
+    assert app.placeOrder.call_args.args[2].clientId == 17
+
+
+@pytest.mark.parametrize("multileg", [False, True])
+@pytest.mark.parametrize("confirmed", [False, True])
+def test_smart_limit_commits_only_confirmed_prices_and_freezes_unknown(multileg, confirmed):
+    from lumibot.entities import SmartLimitConfig, SmartLimitPreset
+    from lumibot.strategies.strategy_executor import StrategyExecutor
+
+    class MinimalStrategy(Strategy):
+        def __init__(self, broker):
+            self.broker = broker
+            self._name = "offline"
+            self.logger = SimpleNamespace(error=Mock())
+
+        def log_message(self, *_args, **_kwargs):
+            return
+
+        def on_trading_iteration(self):
+            return
+
+    cfg = SmartLimitConfig(preset=SmartLimitPreset.FAST, step_seconds=1, final_hold_seconds=2)
+    order = Order(
+        "offline", Asset("SPY"), 1, "buy", order_type=Order.OrderType.SMART_LIMIT,
+        smart_limit=cfg, identifier=42, status=Order.OrderStatus.OPEN,
+    )
+    order.limit_price = 0.30 if multileg else 1.10
+    if multileg:
+        order.order_class = Order.OrderClass.MULTILEG
+        order.child_orders = [
+            Order("offline", Asset("SPY"), 1, "buy"),
+            Order("offline", Asset("IWM"), 1, "sell"),
+        ]
+    order._smart_limit_state = {
+        "created_at": 0.0, "step_index": 0, "steps": cfg.get_step_count(),
+        "step_seconds": 1, "final_hold_seconds": 2, "multileg_order_type": "debit",
+    }
+    original_price = order.limit_price
+    broker = SimpleNamespace(
+        IS_BACKTESTING_BROKER=False, name="interactive_brokers",
+        get_tracked_orders=Mock(return_value=[order]),
+        modify_order=Mock(), cancel_order=Mock(), submit_order=Mock(), submit_orders=Mock(),
+    )
+    strategy = MinimalStrategy(broker)
+    strategy.get_quote = Mock(side_effect=lambda asset, **kwargs: SimpleNamespace(
+        bid=0.50 if multileg and asset.symbol == "SPY" else 0.20 if multileg else 1.00,
+        ask=0.60 if multileg and asset.symbol == "SPY" else 0.30 if multileg else 1.20,
+    ))
+    executor = StrategyExecutor(strategy=strategy)
+
+    def unknown(*_args, **_kwargs):
+        assert order.limit_price == original_price
+        if confirmed:
+            return order
+        raise IBOrderModificationUnknown(42)
+
+    broker.modify_order.side_effect = unknown
+    from unittest.mock import patch
+
+    with patch("lumibot.strategies.strategy_executor.time.monotonic", return_value=1.1):
+        executor._process_smart_limit_orders()
+    if confirmed:
+        assert order.limit_price != original_price
+        assert not getattr(order, "modification_requires_reconciliation", False)
+        strategy.logger.error.assert_not_called()
+        broker.cancel_order.assert_not_called()
+        broker.submit_order.assert_not_called()
+        broker.submit_orders.assert_not_called()
+        return
+    assert order.modification_requires_reconciliation is True
+    assert order.limit_price == original_price
+    strategy.logger.error.assert_called_once()
+    # The latch survives serialization and blocks final-hold cancellation as well
+    # as a subsequent reprice, even if its transient ladder state is rebuilt.
+    restored = Order.from_dict(order.to_dict())
+    assert restored.modification_requires_reconciliation is True
+    broker.get_tracked_orders.return_value = [restored]
+    with patch("lumibot.strategies.strategy_executor.time.monotonic", return_value=1000):
+        executor._process_smart_limit_orders()
+    broker.modify_order.assert_called_once()
+    broker.cancel_order.assert_not_called()
+    broker.submit_order.assert_not_called()
+    broker.submit_orders.assert_not_called()
 
 
 @pytest.mark.parametrize("status", ["PendingSubmit", "PendingCancel", "Inactive", "Filled"])
