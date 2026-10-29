@@ -8,6 +8,11 @@ Audience: Contributors and operators
 
 ## Overview
 
+The candidate includes the deployed 4.6.4 framework base, including client-scoped
+identity, LAST-tick precedence and staged bracket/OTO submission acknowledgement.
+Modification callbacks coexist with that submission machinery; duplicate-ID
+modification rejections never allocate a new ID or use submission retry logic.
+
 The socket adapter supports positive, finite price changes on active native
 `LMT`, `STP` and `STP LMT` orders. This addresses
 [issue #12](https://github.com/malkam03/lumibot/issues/12). The REST adapter is

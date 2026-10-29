@@ -285,17 +285,69 @@ class StrategyExecutor(Thread):
         )
 
     def _scheduled_drain_after_iteration(self):
-        if not _truthy(os.environ.get("LUMIBOT_SCHEDULED_EXECUTION")):
-            return
-        if _int_env("LUMIBOT_SCHEDULED_POST_ITERATION_SECONDS", 0) <= 0:
-            return
         self._get_scheduled_timing().drain_after_iteration(
             stop_event=self.stop_event,
-            process_queue=self.process_queue,
+            process_queue=self._process_run_once_work,
+            pending_work=self._scheduled_pending_work,
+            work_timeout_seconds=self._scheduled_work_timeout_seconds,
             now_utc=self._scheduled_now_utc,
             monotonic=time.monotonic,
             sleep=time.sleep,
         )
+
+    def _run_once_active_orders(self):
+        get_active = getattr(self.broker, "get_active_tracked_orders", None)
+        if callable(get_active):
+            orders = get_active(strategy=self.strategy.name)
+            # is_active can be true on a terminal parent because it has resting
+            # bracket children. Those children must not prolong the entry ladder.
+            return [order for order in orders if not order.is_filled() and not order.is_canceled()]
+        get_tracked = getattr(self.broker, "get_tracked_orders", None)
+        if callable(get_tracked):
+            return [order for order in get_tracked(self.strategy.name) if order.is_active()]
+        return []
+
+    def _scheduled_pending_work(self):
+        """Only runtime-managed work blocks exit; passive broker orders do not."""
+        pending = {}
+        submissions = getattr(self.broker, "_orders_queue", None)
+        # qsize/empty miss a dequeued submission whose broker request is still running.
+        unfinished = getattr(submissions, "unfinished_tasks", 0)
+        if unfinished:
+            pending["broker_submissions"] = unfinished
+        for order in self._run_once_active_orders():
+            if order.order_type == Order.OrderType.SMART_LIMIT and order.smart_limit is not None:
+                pending["smart_limit_orders"] = pending.get("smart_limit_orders", 0) + 1
+            elif str(order.status).lower() in {"cancelling", "pending_cancel", "pending_replace", "unprocessed"}:
+                pending["broker_transitions"] = pending.get("broker_transitions", 0) + 1
+        queued_callbacks = self.queue.qsize() + self.priority_queue.qsize()
+        if queued_callbacks:
+            pending["order_callbacks"] = queued_callbacks
+        return pending
+
+    def _scheduled_work_timeout_seconds(self):
+        """Allow configured SmartLimit lifetimes plus bounded broker-response grace."""
+        timeout = 300.0
+        for order in self._run_once_active_orders():
+            config = getattr(order, "smart_limit", None)
+            if order.order_type != Order.OrderType.SMART_LIMIT or config is None:
+                continue
+            duration = (
+                max(config.get_step_count() - 1, 0) * max(config.get_step_seconds(), 1)
+                + max(config.get_final_hold_seconds(), 0)
+            )
+            timeout = max(timeout, duration + 300.0)
+        return timeout
+
+    def _process_run_once_work(self):
+        # run_once does not start the continuous live check_queue worker. It
+        # must advance native SmartLimit ladders itself until they are terminal.
+        self.process_queue()
+        if callable(getattr(self.broker, "get_active_tracked_orders", None)) or callable(
+            getattr(self.broker, "get_tracked_orders", None)
+        ):
+            self._process_smart_limit_orders()
+        self.process_queue()
 
     @staticmethod
     def _scheduled_target_event():
@@ -569,6 +621,14 @@ class StrategyExecutor(Thread):
         return payload
 
     def sync_broker(self):
+        try:
+            self._sync_broker()
+        finally:
+            if not self.broker.IS_BACKTESTING_BROKER:
+                self.broker._hold_trade_events = False
+                self.broker.process_held_trades()
+
+    def _sync_broker(self):
         # Log that we are syncing the broker.
         self.strategy.logger.debug("Syncing the broker.")
 
@@ -656,15 +716,21 @@ class StrategyExecutor(Thread):
         # ORDERS
         orders_broker = self.broker._pull_all_orders(self.name, self.strategy)
         # Filter out None orders to prevent crashes
-        orders_broker = [order for order in orders_broker if order is not None]
+        orders_broker = [
+            order for order in orders_broker if order is not None and self.broker._owns_order(order)
+        ]
         if len(orders_broker) > 0 or self.broker.get_all_orders():
-            orders_lumi = self.broker.get_all_orders()
-            orders_lumi_by_identifier = self._index_orders_by_identifier(orders_lumi)
+            orders_lumi = [
+                order for order in self.broker.get_all_orders() if self.broker._owns_order(order)
+            ]
+            orders_lumi_by_identifier = self._index_orders_by_identifier(
+                orders_lumi, key=self.broker._order_sync_key
+            )
 
             # Check orders at the broker against those in lumibot.
             for order in orders_broker:
                 # Check against existing orders.
-                order_lumi = orders_lumi_by_identifier.get(order.identifier)
+                order_lumi = orders_lumi_by_identifier.get(self.broker._order_sync_key(order))
                 if isinstance(order_lumi, list):
                     self.strategy.logger.warning(
                         f"Multiple orders found in lumibot with the same identifier {order.identifier}. "
@@ -673,9 +739,26 @@ class StrategyExecutor(Thread):
                         f"and the 'new' queue never gets cleared causing duplicate orders to be added to lumibot. "
                         f"Orders: {order_lumi}"
                     )
-                    order_lumi = self.broker._clean_order_trackers(order)
+                    verified_matches = [
+                        candidate for candidate in order_lumi
+                        if self.broker._orders_match(candidate, order)
+                    ]
+                    if not verified_matches:
+                        self.strategy.logger.warning(
+                            "Conflicting broker order identity; ignoring snapshot order."
+                        )
+                        continue
+                    if len(verified_matches) > 1:
+                        order_lumi = self.broker._clean_order_trackers(order)
+                    else:
+                        order_lumi = verified_matches[0]
+
+                if order_lumi and not self.broker._orders_match(order_lumi, order):
+                    self.strategy.logger.warning("Conflicting broker order identity; ignoring snapshot order.")
+                    continue
 
                 if order_lumi:
+                    self.broker._record_order_identity(order_lumi, order)
                     # Compare the orders.
                     if not order_lumi.equivalent_status(order.status):
                         order_lumi.status = order.status
@@ -767,11 +850,14 @@ class StrategyExecutor(Thread):
                         if order.is_active():
                             self.broker._process_new_order(order)
 
-            broker_identifiers = self._get_all_order_identifiers(orders_broker)
+            broker_identifiers = {
+                self.broker._order_sync_key(candidate)
+                for order in orders_broker for candidate in [order, *order.child_orders]
+            }
             for order_lumi in orders_lumi:
                 # Remove lumibot orders if not in broker.
                 # Check both main order IDs and child order IDs from broker
-                if order_lumi.identifier not in broker_identifiers:
+                if self.broker._order_sync_key(order_lumi) not in broker_identifiers:
                     # Filled or canceled orders can be dropped by the broker as they no longer have any effect.
                     # However, active orders should not be dropped as they are still in effect and if they can't
                     # be found in the broker, they should be canceled because something went wrong.
@@ -809,14 +895,12 @@ class StrategyExecutor(Thread):
                         )
 
         self.broker._invalidate_order_caches()
-        self.broker._hold_trade_events = False
-        self.broker.process_held_trades()
 
     @staticmethod
-    def _index_orders_by_identifier(orders: list[Order]) -> dict:
+    def _index_orders_by_identifier(orders: list[Order], key=None) -> dict:
         orders_by_identifier = {}
         for order in orders:
-            identifier = order.identifier
+            identifier = key(order) if key else order.identifier
             existing = orders_by_identifier.get(identifier)
             if existing is None:
                 orders_by_identifier[identifier] = order
@@ -1017,6 +1101,12 @@ class StrategyExecutor(Thread):
         for order in orders:
             smart_limit = getattr(order, "smart_limit", None)
             if smart_limit is None or order.order_type != Order.OrderType.SMART_LIMIT:
+                continue
+            if order.is_filled() or order.is_canceled():
+                continue
+            if str(order.status).lower() in {"cancelling", "pending_cancel", "pending_replace"}:
+                # Keep the run alive for broker confirmation without repeatedly
+                # canceling/repricing an order whose mutation is already pending.
                 continue
 
             state = getattr(order, "_smart_limit_state", None)
@@ -2545,10 +2635,6 @@ class StrategyExecutor(Thread):
             )
             self.process_queue()
             self._scheduled_drain_after_iteration()
-            self._scheduled_record_timing(
-                status="completed",
-                exact_timing_verified=True,
-            )
             return True
         finally:
             self._in_trading_iteration = False
@@ -2584,6 +2670,11 @@ class StrategyExecutor(Thread):
             iteration_ran = self._run_live_once()
             if iteration_ran and self._run_once_user_iteration_ran:
                 self._on_strategy_end()
+                # on_strategy_end and its callbacks can enqueue more broker
+                # work. Publish and disconnect only after that work finishes too.
+                if self._scheduled_pending_work():
+                    self._scheduled_drain_after_iteration()
+                self._scheduled_record_timing(status="completed", exact_timing_verified=True)
             if iteration_ran:
                 self._publish_run_once_final_cloud_state()
 

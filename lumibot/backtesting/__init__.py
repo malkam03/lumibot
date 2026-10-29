@@ -11,6 +11,7 @@ _NAME_TO_MODULE = {
     "DataBentoDataBacktestingPandas": "databento_backtesting_pandas",
     "DataBentoDataBacktestingPolars": "databento_backtesting_polars",
     "InteractiveBrokersRESTBacktesting": "interactive_brokers_rest_backtesting",
+    "InteractiveBrokersTWSBacktesting": "interactive_brokers_tws_backtesting",
     "PandasDataBacktesting": "pandas_backtesting",
     "PolymarketBacktesting": "polymarket_backtesting",
     "PolygonDataBacktesting": "polygon_backtesting",

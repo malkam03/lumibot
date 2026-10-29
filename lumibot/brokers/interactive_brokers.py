@@ -265,6 +265,8 @@ class InteractiveBrokers(Broker):
     def _parse_broker_order(self, response, strategy_name, strategy_object=None):
         """Parse a broker order representation
         to an order object"""
+        if not self._owns_native_order(response):
+            return None
 
         asset_type = [k for k, v in TYPE_MAP.items() if v == response.contract.secType][0]
         totalQuantity = response.totalQuantity
@@ -302,13 +304,19 @@ class InteractiveBrokers(Broker):
 
         order._transmitted = True
         order.set_identifier(response.orderId)
+        order.broker_client_id = response.clientId
+        order.broker_perm_id = getattr(response, "permId", None)
+        order.broker_account = getattr(response, "account", None)
         order.status = response.orderState.status
         order.update_raw(response)
         return order
 
     def _parse_order_object(self, strategy_name, contract, quantity, action, limit_price = None, stop_price = None, time_in_force = None, good_till_date = None):
         asset_type = [k for k, v in TYPE_MAP.items() if v == contract.secType][0]
-        symbol = self._normalize_symbol_for_internal(contract.localSymbol, asset_type=asset_type)
+        contract_symbol = (
+            contract.symbol if contract.secType in ("OPT", "FUT") else contract.localSymbol
+        )
+        symbol = self._normalize_symbol_for_internal(contract_symbol, asset_type=asset_type)
 
         expiration = None
         multiplier = 1
@@ -320,7 +328,7 @@ class InteractiveBrokers(Broker):
             multiplier = contract.multiplier
 
         right = None
-        strike = None
+        strike = 0.0
         if contract.secType == "OPT":
             right = "CALL" if contract.right == "C" else "PUT"
             strike = contract.strike
@@ -348,14 +356,54 @@ class InteractiveBrokers(Broker):
 
     def _pull_broker_order(self, order_id):
         """Get a broker order representation by its id"""
-        pull_order = [order for order in self.ib.get_open_orders() if order.orderId == order_id]
+        pull_order = [order for order in self._pull_broker_all_orders() if order.orderId == order_id]
         response = pull_order[0] if len(pull_order) > 0 else None
         return response
 
     def _pull_broker_all_orders(self):
         """Get the broker open orders"""
         orders = self.ib.get_open_orders()
-        return orders
+        if orders is None:
+            raise TimeoutError("IBKR open-order snapshot did not complete")
+        return [order for order in orders if self._owns_native_order(order)]
+
+    def _owns_native_order(self, order):
+        return (
+            getattr(order, "clientId", None) == self.client_id
+            and (
+                not self.subaccount
+                or getattr(order, "account", getattr(order, "acctNumber", None)) == self.subaccount
+            )
+        )
+
+    def _owns_order(self, order):
+        return (
+            getattr(order, "broker_client_id", self.client_id) == self.client_id
+            and (
+                not self.subaccount
+                or getattr(order, "broker_account", None) in (None, "", self.subaccount)
+            )
+        )
+
+    def _order_sync_key(self, order):
+        return (getattr(order, "broker_client_id", self.client_id), order.identifier)
+
+    def _orders_match(self, local, remote):
+        if not self._owns_order(local) or not self._owns_order(remote):
+            return False
+        if self._order_sync_key(local) != self._order_sync_key(remote):
+            return False
+        for attr in ("broker_perm_id", "broker_account"):
+            left, right = getattr(local, attr, None), getattr(remote, attr, None)
+            if left and right and left != right:
+                return False
+        return local.asset == remote.asset
+
+    def _record_order_identity(self, local, remote):
+        for attr in ("broker_client_id", "broker_perm_id", "broker_account"):
+            value = getattr(remote, attr, None)
+            if value is not None and (attr == "broker_client_id" or value):
+                setattr(local, attr, value)
 
     def _flatten_order(self, orders): # implement for stop loss.
         """Not used for Interactive Brokers. Just returns the orders."""
@@ -384,7 +432,8 @@ class InteractiveBrokers(Broker):
     def _submit_order(self, order):
         """Submit an order for an asset"""
         # Initial order
-        order.identifier = self.ib.nextOrderId()
+        order.broker_client_id = self.client_id
+        order.broker_account = self.subaccount
         kwargs = {
             "type": order.order_type,
             "order_class": order.order_class,
@@ -410,13 +459,15 @@ class InteractiveBrokers(Broker):
         if self.subaccount is not None:
             order.account = self.subaccount # to be tested
 
-        self._unprocessed_orders.append(order)
+        if order.order_class == OrderLum.OrderClass.MULTILEG:
+            self._unprocessed_orders.append(order)
         self.ib.execute_order(order)
-        order.status = "submitted"
         return order
 
     def cancel_order(self, order):
         """Cancel an order"""
+        if not self._owns_order(order):
+            raise ValueError("Cannot cancel a foreign IBKR client order")
         self.ib.cancel_order(order)
 
     def _modify_order(self, order: OrderLum, limit_price: Union[float, None] = None,
@@ -430,6 +481,15 @@ class InteractiveBrokers(Broker):
             raise ValueError("Cannot modify an inactive IBKR order.")
         if type(order.identifier) is not int or order.identifier < 0:
             raise ValueError("An existing integer IBKR order identifier is required.")
+        if (
+            getattr(order, "broker_client_id", None) not in (None, self.ib.client_id)
+            or (
+                getattr(order, "broker_account", None) is not None
+                and self.ib.subaccount is not None
+                and order.broker_account != self.ib.subaccount
+            )
+        ):
+            raise ValueError("Cannot modify a foreign IBKR order.")
         if limit_price is None and stop_price is None:
             raise ValueError("At least one price is required.")
         for price in (limit_price, stop_price):
@@ -511,11 +571,50 @@ class InteractiveBrokers(Broker):
         if summary is None:
             return None
 
-        total_cash_value = [float(c["Value"]) for c in summary if c["Tag"] == "TotalCashBalance" and c["Currency"] == 'BASE'][0]
-        gross_position_value = [float(c["Value"]) for c in summary if c["Tag"] == "NetLiquidationByCurrency" and c["Currency"] == 'BASE'][0]
-        net_liquidation_value = [float(c["Value"]) for c in summary if c["Tag"] == "NetLiquidationByCurrency" and c["Currency"] == 'BASE'][0]
+        total_cash_value = self._get_account_summary_value(summary, "TotalCashBalance")
+        gross_position_value = self._get_account_summary_value(summary, "NetLiquidationByCurrency")
+        net_liquidation_value = self._get_account_summary_value(summary, "NetLiquidationByCurrency")
 
         return (total_cash_value, gross_position_value, net_liquidation_value)
+
+    @staticmethod
+    def _normalize_account_summary_tag(tag):
+        if not isinstance(tag, str):
+            return tag
+        if tag.startswith("$LEDGER-"):
+            return tag[len("$LEDGER-"):]
+        if tag.startswith("$LEDGER:"):
+            _, _, normalized_tag = tag.partition("-")
+            if normalized_tag:
+                return normalized_tag
+        return tag
+
+    @classmethod
+    def _get_account_summary_value(cls, summary, tag, currency="BASE"):
+        for row in summary:
+            if row.get("Currency") != currency:
+                continue
+            if cls._normalize_account_summary_tag(row.get("Tag")) != tag:
+                continue
+            try:
+                return float(row["Value"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Interactive Brokers account summary tag {tag!r} for currency {currency!r} "
+                    "did not contain a numeric value."
+                ) from None
+
+        available_tags = sorted(
+            {
+                row.get("Tag")
+                for row in summary
+                if row.get("Currency") == currency and row.get("Tag")
+            }
+        )
+        raise ValueError(
+            f"Interactive Brokers account summary is missing tag {tag!r} for currency {currency!r}. "
+            f"Available tags for that currency: {available_tags}"
+        )
 
     def get_contract_details(self, asset):
         # Used for Interactive Brokers. Convert an asset into a IB Contract.
@@ -588,6 +687,12 @@ class InteractiveBrokers(Broker):
         filled. Market orders executions  will not always trigger a Filled status.
         Therefore this must also be checked using ExecDetails
         """
+        if clientId != self.client_id:
+            return
+        if status == "Inactive" and (
+            orderId in self.ib._pending_submissions or orderId in self.ib._rejected_order_ids
+        ):
+            return
         if status in [
             "PendingSubmit",
             "PendingCancel",
@@ -619,6 +724,12 @@ class InteractiveBrokers(Broker):
         if stored_order is None:
             logger.info(f"Untracked order {orderId} was logged by broker {self.name}")
             return
+        if not self._owns_order(stored_order):
+            return
+        if permId and getattr(stored_order, "broker_perm_id", None) not in (None, 0, permId):
+            return
+        if permId:
+            stored_order.broker_perm_id = permId
 
         # Check the order status submit changes.
         if status == "Submitted":
@@ -640,12 +751,21 @@ class InteractiveBrokers(Broker):
         )
 
     def on_trade_event(self, reqId, contract, execution):
+        if not self._owns_native_order(execution):
+            return False
         orderId = execution.orderId
         stored_order = self.get_tracked_order(orderId)
 
         if stored_order is None:
             logger.info("Untracked order %s was logged by broker %s" % (orderId, self.name))
             return False
+        if not self._owns_order(stored_order):
+            return False
+        perm_id = getattr(execution, "permId", None)
+        if perm_id and getattr(stored_order, "broker_perm_id", None) not in (None, 0, perm_id):
+            return False
+        if perm_id:
+            stored_order.broker_perm_id = perm_id
             # Check the order status submit changes.
         if execution.cumQty < stored_order.quantity:
             type_event = self.PARTIALLY_FILLED_ORDER
@@ -683,15 +803,68 @@ class InteractiveBrokers(Broker):
 
 # ===================INTERACTIVE BROKERS CLASSES===================
 
+@dataclass(frozen=True)
+class IBKRSubmissionLeg:
+    """Outcome of one native leg in an IBKR submission attempt."""
+
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+    UNKNOWN = "unknown"
+    NOT_TRANSMITTED = "not_transmitted"
+
+    order_id: int
+    parent_id: int
+    transmit: bool
+    outcome: str
+    code: Union[int, None] = None
+    message: Union[str, None] = None
+
+
+class IBKROrderSubmissionError(RuntimeError):
+    """IBKR did not accept a whole submission graph.
+
+    ``legs`` describes only the current attempt, after any duplicate-ID refresh.
+    ``outcome`` is ``rejected`` only when no leg can be live at IBKR, ``partial``
+    when some legs were accepted and others rejected, and ``unknown`` when any
+    transmitted leg is still unconfirmed.
+    """
+
+    REJECTED = "rejected"
+    PARTIAL = "partial"
+    UNKNOWN = "unknown"
+
+    def __init__(self, message, *, outcome, client_id, account, legs):
+        super().__init__(message)
+        self.outcome = outcome
+        self.client_id = client_id
+        self.account = account
+        self.legs = tuple(legs)
+        first = next((leg for leg in self.legs if leg.code is not None), None)
+        self.code = first.code if first else None
+        self.error_message = first.message if first else None
+
+    @property
+    def order_ids(self):
+        return tuple(leg.order_id for leg in self.legs)
+
+    @property
+    def parent_order_id(self):
+        return self.legs[0].order_id if self.legs else None
+
+    @property
+    def positively_rejected(self):
+        return self.outcome == self.REJECTED
+
+
+class IBKROrderSubmissionUnknown(IBKROrderSubmissionError, TimeoutError):
+    """No final IBKR acknowledgement arrived; the graph may be live."""
+
+    def __init__(self, message, **kwargs):
+        super().__init__(message, outcome=self.UNKNOWN, **kwargs)
+
+
 class IBWrapper(EWrapper):
     """Listens and collects data from IB."""
-
-    def __init__(self):
-        super().__init__()
-        self._order_request_lock = RLock()
-        self._modification_lock = Lock()
-        self._pending_modifications = {}
-        self._uncertain_modifications = set()
 
     def _finish_modification(self, order_id, outcome, error_code=None):
         with self._modification_lock:
@@ -708,6 +881,49 @@ class IBWrapper(EWrapper):
                     pending.outcome = "unknown"
                     pending.event.set()
         super().connectionClosed()
+
+    ORDER_ACK_STATUSES = frozenset({"Submitted", "PreSubmitted", "Filled"})
+    ORDER_REJECTION_CODES = frozenset({
+        103, 104, 105, 106, 107,
+        109, 110, 111, 113, 114, 115, 116, 117, 118, 119, 120, 121, 122,
+        125, 126, 129, 131, 132, 133, 134, 135, 136, 137,
+        140, 141, 142, 144, 145, 146, 147, 148, 151, 152, 154, 157,
+        201, 202,
+    })
+
+    def __init__(self):
+        super().__init__()
+        self._order_request_lock = RLock()
+        self._modification_lock = Lock()
+        self._pending_modifications = {}
+        self._uncertain_modifications = set()
+        self._order_id_lock = Lock()
+        self._order_id_ready = Event()
+        self._last_order_id = -1
+        self._observed_order_id = -1
+        self._submission_lock = Lock()
+        self._pending_submissions = {}
+        self._submission_state_lock = Lock()
+        self._rejected_order_ids = set()
+
+    def _submission_response(self, identifier, error=None):
+        # Callbacks run on the IB reader thread; the state lock keeps a
+        # rejection and its readiness flag atomic for _submission_snapshot.
+        with self._submission_state_lock:
+            pending = self._pending_submissions.get(identifier)
+            if pending is None:
+                return
+            if error is not None:
+                pending["error"] = error
+            pending["ready"].set()
+
+    def _submission_snapshot(self, identifier):
+        """Return ``(ready, error)`` for a pending submission as one consistent read."""
+        with self._submission_state_lock:
+            pending = self._pending_submissions.get(identifier)
+            if pending is None:
+                return None
+            return pending["ready"].is_set(), pending["error"]
 
     # Error handling code.
     def init_error(self):
@@ -729,10 +945,14 @@ class IBWrapper(EWrapper):
     def error(self, id, error_code, error_string):
         # Warnings are not rejection acknowledgements. Unclassified errors remain
         # uncertain rather than inviting a retry of an order IBKR may have changed.
-        if error_code in {104, 105, 109, 110, 135, 136, 161, 201, 329, 10147, 10148}:
+        if error_code in self.ORDER_REJECTION_CODES | {161, 329, 10147, 10148}:
             self._finish_modification(id, "rejected", error_code)
         elif error_code not in {399, 2109, 2137}:
             self._finish_modification(id, "unknown", error_code)
+        if error_code in self.ORDER_REJECTION_CODES:
+            if error_code == 103 and id in self._pending_submissions:
+                self._rejected_order_ids.add(id)
+            self._submission_response(id, (error_code, error_string))
         if not hasattr(self, "my_errors_queue"):
             self.init_error()
 
@@ -795,7 +1015,7 @@ class IBWrapper(EWrapper):
 
         # If the last price is not available, then use yesterday's closing price
         # This can happen if the market is closed
-        if tickType == 9 and self.tick is None and self.should_use_last_close:
+        if tickType == 9 and self.tick_type_used != 4 and self.should_use_last_close:
             self.price = price
             self.tick_type_used = tickType
 
@@ -999,14 +1219,17 @@ class IBWrapper(EWrapper):
 
         logger.debug("setting nextValidOrderId: %d", orderId)
         self.nextValidOrderId = orderId
+        self._order_id_ready.set()
 
-    def nextOrderId(self):
-        while not hasattr(self, "nextValidOrderId"):
-            print("Waiting for next order id")
-            time.sleep(0.1)
-        oid = self.nextValidOrderId
-        self.nextValidOrderId += 1
-        return oid
+    def nextOrderId(self, timeout=10):
+        with self._order_id_lock:
+            self._order_id_ready.clear()
+            self.reqIds(-1)
+            if not self._order_id_ready.wait(timeout):
+                raise TimeoutError("Timed out waiting for IBKR nextValidId")
+            oid = max(self.nextValidOrderId, self._last_order_id + 1, self._observed_order_id + 1)
+            self._last_order_id = oid
+            return oid
 
     def init_orders(self):
         self.orders = list()
@@ -1037,6 +1260,10 @@ class IBWrapper(EWrapper):
                 ):
                     pending.outcome = "accepted"
                     pending.event.set()
+        self._observed_order_id = max(self._observed_order_id, orderId)
+        if order.clientId == self.client_id:
+            if orderState.status in self.ORDER_ACK_STATUSES:
+                self._submission_response(orderId)
         if not hasattr(self, "orders"):
             self.init_orders()
         openOrdertxt = (
@@ -1059,6 +1286,7 @@ class IBWrapper(EWrapper):
 
         logger.debug(openOrdertxt)
 
+        order.orderId = orderId
         order.contract = contract
         order.orderState = orderState
         self.orders.append(order)
@@ -1087,8 +1315,12 @@ class IBWrapper(EWrapper):
         whyHeld,
         mktCapPrice,
     ):
-        if status in {"Filled", "Cancelled", "ApiCancelled"}:
+        if clientId == self.client_id and status in {"Filled", "Cancelled", "ApiCancelled"}:
             self._finish_modification(orderId, "unknown")
+        self._observed_order_id = max(self._observed_order_id, orderId)
+        if clientId == self.client_id:
+            if status in self.ORDER_ACK_STATUSES:
+                self._submission_response(orderId)
         orderStatustxt = (
             f"orderStatus - "
             f"orderid: {orderId}, "
@@ -1113,6 +1345,8 @@ class IBWrapper(EWrapper):
         )
 
     def execDetails(self, reqId, contract, execution):
+        if execution.clientId == self.client_id:
+            self._submission_response(execution.orderId)
         execDetailstxt = (
             f"execDetails - "
             f"{reqId}, "
@@ -1466,6 +1700,11 @@ class IBClient(EClient):
             ):
                 raise ValueError("Cannot modify an IBKR order owned by another client/account.")
             if (
+                getattr(lumi_order, "broker_perm_id", None) not in (None, 0, original.permId)
+                or getattr(lumi_order, "broker_account", None) not in (None, original.account)
+            ):
+                raise ValueError("IBKR permanent order identity/account does not match the local order.")
+            if (
                 original.contract.symbol != normalize_symbol_for_broker(
                     lumi_order.asset.symbol, broker_name="ibkr", asset_type=lumi_order.asset.asset_type
                 )
@@ -1528,6 +1767,11 @@ class IBClient(EClient):
                     del wrapper._pending_modifications[order_id]
 
     def cancel_order(self, order):
+        if (
+            getattr(order, "broker_client_id", self.client_id) != self.client_id
+            or self.subaccount and getattr(order, "broker_account", None) not in (None, "", self.subaccount)
+        ):
+            raise ValueError("Cannot cancel a foreign IBKR client order")
         order_id = order.identifier
         if not order_id or not isinstance(order_id, int):
             logger.info(
@@ -1635,7 +1879,8 @@ class IBApp(IBWrapper, IBClient):
         if action.lower() in [
             OrderLum.OrderSide.BUY,
             OrderLum.OrderSide.BUY_TO_OPEN,
-            OrderLum.OrderSide.BUY_TO_CLOSE
+            OrderLum.OrderSide.BUY_TO_CLOSE,
+            OrderLum.OrderSide.BUY_TO_COVER,
             ]:
             return OrderLum.OrderSide.BUY.upper()
         elif action.lower() in [
@@ -1699,121 +1944,133 @@ class IBApp(IBWrapper, IBClient):
 
         return contract
 
-    def create_order(self, order):
-        ib_order = Order()
-        if order.order_class == "bracket":
-            if not order.limit_price:
-                logger.info(
-                    f"All bracket orders must have limit price for the originating "
-                    f"order. The bracket order for {order.symbol} is cancelled."
-                )
-                return []
-            parent = Order()
-            parent.orderId = order.identifier if order.identifier else self.nextOrderId()
-            parent.action = self.get_safe_action(order.side)
-            parent.orderType = "LMT"
-            parent.totalQuantity = order.quantity
-            parent.lmtPrice = order.limit_price
-            parent.transmit = False
-
-            takeProfit = Order()
-            takeProfit.orderId = self.nextOrderId()
-            takeProfit.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-            takeProfit.orderType = "LMT"
-            takeProfit.totalQuantity = order.quantity
-            takeProfit.lmtPrice = order.limit_price
-            takeProfit.parentId = parent.orderId
-            takeProfit.transmit = False
-
-            stopLoss = Order()
-            stopLoss.orderId = self.nextOrderId()
-            stopLoss.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-            stopLoss.orderType = "STP"
-            stopLoss.auxPrice = order.stop_price
-            stopLoss.totalQuantity = order.quantity
-            stopLoss.parentId = parent.orderId
-            stopLoss.transmit = True
-
-            bracketOrder = [parent, takeProfit, stopLoss]
-
-            return bracketOrder
-
-        elif order.order_class == "oto":
-            if not order.limit_price:
-                logger.info(
-                    f"All OTO orders must have limit price for the originating order. "
-                    f"The one triggers other order for {order.symbol} is cancelled."
-                )
-                return []
-
-            parent = Order()
-            parent.orderId = order.identifier if order.identifier else self.nextOrderId()
-            parent.action = self.get_safe_action(order.side)
-            parent.orderType = "LMT"
-            parent.totalQuantity = order.quantity
-            parent.lmtPrice = order.limit_price
-            parent.transmit = False
-
-            if order.limit_price:
-                takeProfit = Order()
-                takeProfit.orderId = self.nextOrderId()
-                takeProfit.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-                takeProfit.orderType = "LMT"
-                takeProfit.totalQuantity = order.quantity
-                takeProfit.lmtPrice = order.limit_price
-                takeProfit.parentId = parent.orderId
-                takeProfit.transmit = True
-                return [parent, takeProfit]
-
-            elif order.stop_price:
-                stopLoss = Order()
-                stopLoss.orderId = self.nextOrderId()
-                stopLoss.action = "SELL" if self.get_safe_action(parent.action) == "BUY" else "BUY"
-                stopLoss.orderType = "STP"
-                stopLoss.auxPrice = order.stop_price
-                stopLoss.totalQuantity = order.quantity
-                stopLoss.parentId = parent.orderId
-                stopLoss.transmit = True
-                return [parent, stopLoss]
-
-        elif order.order_class == "oco":
-            takeProfit = Order()
-            takeProfit.orderId = order.identifier if order.identifier else self.nextOrderId()
-            takeProfit.action = self.get_safe_action(order.side)
-            takeProfit.orderType = "LMT"
-            takeProfit.totalQuantity = order.quantity
-            takeProfit.lmtPrice = order.limit_price
-            takeProfit.transmit = False
-
-            oco_Group = f"oco_{takeProfit.orderId}"
-            takeProfit.ocaGroup = oco_Group
-            takeProfit.ocaType = 1
-
-            stopLoss = Order()
-            stopLoss.orderId = self.nextOrderId()
-            stopLoss.action = self.get_safe_action(order.side)
-            stopLoss.orderType = "STP"
-            stopLoss.totalQuantity = order.quantity
-            stopLoss.auxPrice = order.stop_price
-            stopLoss.transmit = True
-
-            stopLoss.ocaGroup = oco_Group
-            stopLoss.ocaType = 1
-
-            return [takeProfit, stopLoss]
+    def _convert_order_leg(self, order):
+        """Translate one LumiBot order into a native ibapi order without allocating an ID."""
+        native = Order()
+        native.action = self.get_safe_action(order.side)
+        try:
+            native.orderType = ORDERTYPE_MAPPING[order.order_type]
+        except KeyError as exc:
+            raise ValueError(f"Unsupported TWS order type: {order.order_type}") from exc
+        if order.order_type == OrderLum.OrderType.STOP_LIMIT:
+            if order.stop_price is None or order.stop_limit_price is None:
+                raise ValueError("TWS stop-limit requires stop_price and stop_limit_price")
+            native.lmtPrice = order.stop_limit_price
         else:
-            ib_order.action = self.get_safe_action(order.side)
-            ib_order.orderType = ORDERTYPE_MAPPING[order.order_type]
-            ib_order.totalQuantity = order.quantity
-            ib_order.lmtPrice = order.limit_price if order.limit_price else 0
-            ib_order.auxPrice = order.stop_price if order.stop_price else ""
-            ib_order.trailingPercent = order.trail_percent if order.trail_percent else ""
-            if order.trail_price:
-                ib_order.auxPrice = order.trail_price
-            ib_order.orderId = order.identifier if order.identifier else self.nextOrderId()
-            ib_order.tif = order.time_in_force.upper()
-            ib_order.goodTillDate = order.good_till_date.strftime("%Y%m%d %H:%M:%S") if order.good_till_date else ""
-            return [ib_order]
+            native.lmtPrice = order.limit_price if order.limit_price is not None else 0
+        native.totalQuantity = order.quantity
+        native.auxPrice = order.stop_price if order.stop_price is not None else ""
+        native.trailingPercent = order.trail_percent if order.trail_percent is not None else ""
+        if order.trail_price is not None:
+            native.auxPrice = order.trail_price
+        native.tif = order.time_in_force.upper()
+        if order.good_till_date:
+            expiry = order.good_till_date
+            if expiry.tzinfo is not None and expiry.utcoffset() is not None:
+                native.goodTillDate = expiry.astimezone(datetime.timezone.utc).strftime("%Y%m%d %H:%M:%S UTC")
+            else:
+                native.goodTillDate = expiry.strftime("%Y%m%d %H:%M:%S")
+        else:
+            native.goodTillDate = ""
+        native.outsideRth = False
+        native.eTradeOnly = False
+        native.firmQuoteOnly = False
+        return native
+
+    def _validate_advanced_children(self, order):
+        children = order.child_orders
+        expected = {
+            OrderLum.OrderClass.BRACKET: (1, 2),
+            OrderLum.OrderClass.OTO: (1,),
+            OrderLum.OrderClass.OCO: (2,),
+        }[order.order_class]
+        if len(children) not in expected:
+            raise ValueError(f"{order.order_class} requires {expected} child orders; got {len(children)}")
+        if len({id(child) for child in children}) != len(children):
+            raise ValueError("TWS child orders must be distinct")
+        if order.order_class == OrderLum.OrderClass.BRACKET and len(children) == 2:
+            if {child.order_type for child in children if isinstance(child, OrderLum)} != {
+                OrderLum.OrderType.LIMIT, OrderLum.OrderType.STOP,
+            }:
+                raise ValueError("TWS bracket with two children requires a limit and a stop exit")
+
+        parent_action = self.get_safe_action(order.side)
+        for child in children:
+            if not isinstance(child, OrderLum) or child.child_orders or child.order_class != OrderLum.OrderClass.SIMPLE:
+                raise ValueError("Unsupported TWS child order graph: children must be simple orders")
+            if child.asset != order.asset or child.quote != order.quote:
+                raise ValueError("TWS child asset/quote must match parent")
+            if child.quantity != order.quantity:
+                raise ValueError("TWS child quantity must match parent quantity")
+            if child.time_in_force != order.time_in_force or child.good_till_date != order.good_till_date:
+                raise ValueError("TWS child time_in_force and good_till_date must match parent")
+            action = self.get_safe_action(child.side)
+            if (
+                order.order_class == OrderLum.OrderClass.OCO and action != parent_action
+                or order.order_class != OrderLum.OrderClass.OCO and action == parent_action
+            ):
+                raise ValueError("TWS child side must close the parent or match the OCO peer side")
+            if child.order_type == OrderLum.OrderType.LIMIT:
+                valid_price = child.limit_price is not None and child.stop_price is None
+            elif child.order_type == OrderLum.OrderType.STOP:
+                valid_price = child.stop_price is not None and child.limit_price is None
+            else:
+                raise ValueError(f"Unsupported TWS child order type: {child.order_type}")
+            if not valid_price or any(
+                value is not None for value in (
+                    child.stop_limit_price, child.trail_price, child.trail_percent,
+                )
+            ):
+                raise ValueError("Unsupported TWS child price fields")
+
+    def create_order(self, order):
+        order_class = order.order_class
+        if order_class not in (
+            OrderLum.OrderClass.BRACKET, OrderLum.OrderClass.OTO, OrderLum.OrderClass.OCO,
+        ):
+            native = self._convert_order_leg(order)
+            native.orderId = order.identifier if isinstance(order.identifier, int) else self.nextOrderId()
+            return [native]
+
+        self._validate_advanced_children(order)
+        if order_class == OrderLum.OrderClass.OCO:
+            legs = [self._convert_order_leg(child) for child in order.child_orders]
+        else:
+            legs = [self._convert_order_leg(order)]
+            legs.extend(self._convert_order_leg(child) for child in order.child_orders)
+
+        first_id = (
+            order.identifier
+            if isinstance(order.identifier, int) and not isinstance(order.identifier, bool) and order.identifier > 0
+            else self.nextOrderId()
+        )
+        legs[0].orderId = first_id
+        allocated = {first_id}
+        for leg in legs[1:]:
+            next_id = self.nextOrderId()
+            if next_id < first_id:
+                raise ValueError("TWS child order ID must follow the parent ID")
+            while next_id in allocated:
+                next_id = self.nextOrderId()
+            leg.orderId = next_id
+            allocated.add(next_id)
+
+        if order_class == OrderLum.OrderClass.OCO:
+            for leg in legs:
+                leg.ocaGroup = f"oco_{first_id}"
+                leg.ocaType = 1
+                leg.transmit = True
+        else:
+            legs[0].transmit = False
+            for leg in legs[1:]:
+                leg.parentId = first_id
+                leg.transmit = leg is legs[-1]
+        child_legs = legs if order_class == OrderLum.OrderClass.OCO else legs[1:]
+        for child, leg in zip(order.child_orders, child_legs):
+            child.identifier = leg.orderId
+            if order_class != OrderLum.OrderClass.OCO:
+                child.parent_identifier = first_id
+        return legs
 
     def _create_multileg_order(self, order, exchange=None, **kwargs):
         """Submit a list of orders as a single multileg order"""
@@ -1837,7 +2094,7 @@ class IBApp(IBWrapper, IBClient):
         combo_contract.currency = order.child_orders[0].quote.symbol  # Assuming all child orders have the same currency
 
         # Create a new order ID for the combo order
-        combo_order_id = self.nextOrderId()
+        combo_order_id = order.identifier
 
         # Initialize the combo legs
         combo_contract.comboLegs = []
@@ -1881,18 +2138,193 @@ class IBApp(IBWrapper, IBClient):
         # Return the combo contract and order
         return combo_contract, combo_order
 
-    def execute_order(self, orders):
+    def execute_order(self, orders, timeout=10):
+        # Only the submitting thread waits; callbacks must keep the reader thread free.
+        with self._submission_lock:
+            return self._execute_order(orders, timeout)
+
+    def _record_submission_rejection(self, identifiers, tracked_orders, rejection):
+        if self.ib_broker is None:
+            return
+        for tracked in tracked_orders:
+            # OCO's container shares its first peer's ID; only the peer is a broker order.
+            if tracked.identifier in identifiers and tracked.order_class != OrderLum.OrderClass.OCO:
+                self.ib_broker._process_trade_event(
+                    tracked, self.ib_broker.ERROR_ORDER, error=rejection,
+                )
+
+    def _reassign_order_ids(self, ib_orders, start_index, tracked_orders, timeout):
+        replacements = {
+            old_id: self.nextOrderId(timeout=timeout)
+            for old_id, _, _ in ib_orders[start_index:]
+        }
+        for tracked in tracked_orders:
+            tracked.identifier = replacements.get(tracked.identifier, tracked.identifier)
+            tracked.parent_identifier = replacements.get(
+                tracked.parent_identifier, tracked.parent_identifier
+            )
+        for leg_index in range(start_index, len(ib_orders)):
+            old_id, leg_contract, leg = ib_orders[leg_index]
+            leg.orderId = replacements[old_id]
+            leg.parentId = replacements.get(leg.parentId, leg.parentId)
+            ib_orders[leg_index] = (leg.orderId, leg_contract, leg)
+        if self.ib_broker is not None:
+            self.ib_broker._invalidate_order_caches()
+
+    def _place_submission_leg(self, ib_orders, leg_index, tracked_orders, pending_ids):
+        identifier, contract, native = ib_orders[leg_index]
+        for tracked in tracked_orders:
+            if tracked.identifier == identifier:
+                tracked.status = "submitted"
+        native.clientId = self.client_id
+        if self.subaccount:
+            native.account = self.subaccount
+        self._pending_submissions[identifier] = {
+            "ready": Event(), "error": None, "transmit": native.transmit,
+        }
+        pending_ids.append(identifier)
+        self.placeOrder(identifier, contract, native)
+
+    def _graph_leg_outcomes(self, ib_orders, start, end, placed_end, deadline):
+        # IBKR stays silent for transmit=False legs until the graph's last leg
+        # transmits them, so only the transmitting leg is awaited first.
+        transmit_id = ib_orders[end][0]
+        transmit_state = "not_sent"
+        transmit_sent = placed_end == end
+        if transmit_sent:
+            transmit = self._pending_submissions[transmit_id]
+            transmit["ready"].wait(max(0, deadline - time.monotonic()))
+            ready, error = self._submission_snapshot(transmit_id)
+            if not ready:
+                transmit_state = "unknown"
+            else:
+                transmit_state = "rejected" if error is not None else "accepted"
+                for leg_index in range(start, end + 1):
+                    self._pending_submissions[ib_orders[leg_index][0]]["ready"].wait(
+                        max(0, deadline - time.monotonic())
+                    )
+
+        legs = []
+        for leg_index in range(start, end + 1):
+            identifier, _, native = ib_orders[leg_index]
+            snapshot = self._submission_snapshot(identifier) if leg_index <= placed_end else None
+            code = message = None
+            if snapshot is None:
+                outcome = IBKRSubmissionLeg.NOT_TRANSMITTED
+            elif snapshot[1] is not None:
+                outcome = IBKRSubmissionLeg.REJECTED
+                code, message = snapshot[1]
+            elif snapshot[0]:
+                outcome = IBKRSubmissionLeg.ACCEPTED
+            elif transmit_sent:
+                # Once the transmitting leg was sent, a rejection of that leg
+                # alone does not prove a silent staged leg never became live.
+                outcome = IBKRSubmissionLeg.UNKNOWN
+            else:
+                outcome = IBKRSubmissionLeg.NOT_TRANSMITTED
+            legs.append(IBKRSubmissionLeg(
+                identifier, native.parentId, native.transmit, outcome, code, message,
+            ))
+        return legs, transmit_state
+
+    def _submission_error(self, legs, outcome):
+        if outcome == IBKROrderSubmissionError.UNKNOWN:
+            message = "IBKR order acknowledgement timed out; submission outcome is unknown; not retrying"
+            return IBKROrderSubmissionUnknown(
+                message, client_id=self.client_id, account=self.subaccount, legs=legs,
+            )
+        first = next(leg for leg in legs if leg.code is not None)
+        message = f"IBKR order rejected ({first.code}): {first.message}"
+        if outcome == IBKROrderSubmissionError.PARTIAL:
+            message += "; other legs of the order graph were accepted"
+        return IBKROrderSubmissionError(
+            message, outcome=outcome, client_id=self.client_id, account=self.subaccount, legs=legs,
+        )
+
+    def _submit_graph(self, ib_orders, start, end, tracked_orders, timeout, pending_ids):
+        """Place one parent/child graph whose last leg transmits the earlier legs."""
+        place_from = start
+        retried = False
+        while True:
+            placed_end = place_from - 1
+            for leg_index in range(place_from, end + 1):
+                # Never transmit a graph after any earlier leg was already rejected.
+                if any(
+                    self._pending_submissions[ib_orders[prior][0]]["error"] is not None
+                    for prior in range(start, leg_index)
+                ):
+                    break
+                self._place_submission_leg(ib_orders, leg_index, tracked_orders, pending_ids)
+                placed_end = leg_index
+            deadline = time.monotonic() + timeout
+            legs, transmit_state = self._graph_leg_outcomes(
+                ib_orders, start, end, placed_end, deadline,
+            )
+            outcomes = [leg.outcome for leg in legs]
+            rejected = [i for i, leg in enumerate(legs) if leg.outcome == IBKRSubmissionLeg.REJECTED]
+
+            if not rejected and all(o == IBKRSubmissionLeg.ACCEPTED for o in outcomes):
+                return legs
+            if IBKRSubmissionLeg.UNKNOWN in outcomes or transmit_state == "unknown":
+                raise self._submission_error(legs, IBKROrderSubmissionError.UNKNOWN)
+
+            first = rejected[0]
+            # A duplicate ID is retried only when nothing from that leg onward
+            # can be live: the graph was not transmitted and no later leg was accepted.
+            if (
+                not retried
+                and legs[first].code == 103
+                and transmit_state in ("rejected", "not_sent")
+                and IBKRSubmissionLeg.ACCEPTED not in outcomes[first:]
+            ):
+                retried = True
+                retry_index = start + first
+                logger.warning("IBKR duplicate order ID rejected; retrying once with fresh IDs")
+                for leg_index in range(retry_index, end + 1):
+                    old_id = ib_orders[leg_index][0]
+                    self._pending_submissions.pop(old_id, None)
+                    if old_id in pending_ids:
+                        pending_ids.remove(old_id)
+                try:
+                    self._reassign_order_ids(ib_orders, retry_index, tracked_orders, timeout)
+                except TimeoutError as exc:
+                    self._raise_graph_rejection(legs, tracked_orders, exc)
+                place_from = retry_index
+                continue
+
+            self._raise_graph_rejection(legs, tracked_orders)
+
+    def _raise_graph_rejection(self, legs, tracked_orders, cause=None):
+        # Accepted legs stay live, so a graph with any accepted leg is PARTIAL
+        # and only its rejected legs receive error events.
+        if any(leg.outcome == IBKRSubmissionLeg.ACCEPTED for leg in legs):
+            error = self._submission_error(legs, IBKROrderSubmissionError.PARTIAL)
+            identifiers = {leg.order_id for leg in legs if leg.outcome == IBKRSubmissionLeg.REJECTED}
+        else:
+            error = self._submission_error(legs, IBKROrderSubmissionError.REJECTED)
+            identifiers = {leg.order_id for leg in legs}
+        self._record_submission_rejection(identifiers, tracked_orders, error)
+        if cause is not None:
+            raise error from cause
+        raise error
+
+    def _execute_order(self, orders, timeout):
         # Create a queue to store the new order.
         self.wrapper.init_new_orders()
 
         if not isinstance(orders, list):
             orders = [orders]
-
         ib_orders = []
+        parents_to_track = []
+        children_to_track = []
         for order in orders:
+            order.identifier = self.nextOrderId(timeout=timeout)
+            order.broker_client_id = self.client_id
+            order.broker_account = self.subaccount
             # Check if the order is a multileg order
             if order.order_class == OrderLum.OrderClass.MULTILEG:
                 contract_object, order_object = self._create_multileg_order(order)
+                order.identifier = order_object.orderId
 
                 order_objects = [order_object]
 
@@ -1907,6 +2339,13 @@ class IBApp(IBWrapper, IBClient):
                     currency=order.quote.symbol,
                 )
                 order_objects = self.create_order(order)
+                order.identifier = order_objects[0].orderId
+                if order.order_class != OrderLum.OrderClass.OCO:
+                    parents_to_track.append(order)
+                if order.order_class in (
+                    OrderLum.OrderClass.BRACKET, OrderLum.OrderClass.OTO, OrderLum.OrderClass.OCO,
+                ):
+                    children_to_track.extend(order.child_orders)
 
             if len(order_objects) == 0:
                 continue
@@ -1921,8 +2360,47 @@ class IBApp(IBWrapper, IBClient):
                 nextID = order_object.orderId if order_object.orderId else self.nextOrderId()
                 ib_orders.append((nextID, contract_object, order_object))
 
-        for ib_order in ib_orders:
-            if len(ib_order) == 0:
-                continue
+        if self.ib_broker is not None:
+            # OCO's container shares its first peer's ID and has no native
+            # order of its own. Register only the two peers for that class.
+            for tracked in (*parents_to_track, *children_to_track):
+                tracked.broker_client_id = self.client_id
+                tracked.broker_account = self.subaccount
+                self.ib_broker._unprocessed_orders.append(tracked)
 
-            self.placeOrder(*ib_order)
+        tracked_orders = list({id(item): item for item in [
+            *orders, *parents_to_track, *children_to_track,
+        ]}.values())
+        pending_ids = []
+        accepted_legs = []
+        index = 0
+        try:
+            while index < len(ib_orders):
+                group_end = next(
+                    (
+                        leg_index for leg_index in range(index, len(ib_orders))
+                        if ib_orders[leg_index][2].transmit
+                    ),
+                    len(ib_orders) - 1,
+                )
+                try:
+                    accepted_legs.extend(self._submit_graph(
+                        ib_orders, index, group_end, tracked_orders, timeout, pending_ids,
+                    ))
+                except IBKROrderSubmissionError as exc:
+                    if not accepted_legs:
+                        raise
+                    # Earlier graphs of this call (e.g. an OCO peer) are already
+                    # live, so the call as a whole is never a clean rejection.
+                    outcome = (
+                        IBKROrderSubmissionError.UNKNOWN
+                        if exc.outcome == IBKROrderSubmissionError.UNKNOWN
+                        else IBKROrderSubmissionError.PARTIAL
+                    )
+                    raise self._submission_error(
+                        (*accepted_legs, *exc.legs), outcome,
+                    ) from exc
+                index = group_end + 1
+        finally:
+            for identifier in pending_ids:
+                self._pending_submissions.pop(identifier, None)

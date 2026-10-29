@@ -3,6 +3,8 @@
 LumiBot is open source. Never put private, incriminating, account-specific, or
 machine-specific information in this file or any other tracked repo file.
 
+PII includes personal (non-public) names and contact details, postal addresses, government identifiers, dates of birth, and account/customer identifiers.
+
 - Do not include usernames, passwords, API keys, tokens, account emails,
   customer identifiers, broker credentials, paid vendor credentials, private
   hostnames, private URLs, cookies, local profile paths, or absolute personal
@@ -16,6 +18,14 @@ machine-specific information in this file or any other tracked repo file.
   in the private repo/docs/secret store, not in this public LumiBot checkout.
 - If sensitive data is found in tracked files, remove it immediately, scan for
   nearby leaks, and treat exposed credentials as needing rotation.
+- Before publishing a branch or pull request, inspect the complete proposed diff,
+  PR title/body, review comments/replies, and any attachments for PII, secrets, account-specific data, and
+  machine-specific details. Use a repository-appropriate scanner plus a manual
+  review; replace legitimate examples with safe placeholders and do not reproduce
+  discovered sensitive values in chat or review comments.
+- Show the reviewed code/diff and PII-review result to the requester and wait for explicit
+  approval before pushing commits or creating/updating a pull request. A request to
+  implement a change is not approval to publish it.
 
 # Express Authorization Required For LumiBot Changes
 
@@ -157,6 +167,34 @@ This repo is frequently edited by **multiple AI sessions**. To avoid lost work:
   - If the user explicitly requests a release PR, **the PR head must be the
     existing version branch** (e.g., `version/4.4.31`), not a new feature branch.
   - Do not switch branches unless explicitly instructed; if you suspect you're on the wrong branch, stop and ask.
+
+- **Fork integration branch (`malkam03-dev`):** this branch intentionally combines
+  fork work with upstream `dev` history so fork changes can later be proposed
+  upstream. When asked to sync upstream changes:
+  - Fetch `origin/dev` and `upstream/dev`, then compare their tips. If they
+    differ, establish which changes are missing from `origin/dev` before using
+    it as the sync source; do not silently substitute one remote for the other.
+  - Confirm the current branch is `malkam03-dev` and inspect the working tree
+    and branch graph before changing history.
+  - If `origin/dev` is already an ancestor of `HEAD`, report that it is already
+    included rather than creating a redundant merge.
+  - Otherwise merge `origin/dev` into `malkam03-dev`. Do not rebase, reset, or
+    cherry-pick the mixed branch as a substitute for this sync; preserving both
+    fork and upstream commit ancestry makes later upstream proposals auditable.
+  - Preserve fork-only changes when resolving conflicts, run relevant tests, and
+    update `docs/UPSTREAM_FIX_RECONCILIATION.md` when the sync changes what is
+    known about upstream overlap. Do not push unless explicitly requested.
+  - **Upstream contribution flow:** keep `malkam03-dev` as the integration
+    branch. When explicitly asked to propose selected fork features upstream,
+    create a separate branch in the fork based on current `upstream/dev`, then
+    cherry-pick only the feature commits needed for that proposal. Do not
+    cherry-pick integration merge commits or open a PR from the mixed
+    `malkam03-dev` branch. Verify the contribution branch contains only the
+    intended changes, resolve conflicts there, and run relevant tests. When
+    explicitly asked to open the PR, its base is `Lumiwealth/lumibot:dev` and
+    its head is the fork's contribution branch, not `malkam03-dev`. This keeps
+    upstream syncs flowing into the integration branch while allowing individual
+    fork features to be reviewed upstream independently.
 - **No “feature branch chaining”:** if you’re already on a feature/WIP or version branch (e.g., `feature/*`, `fix/*`, `wip/*`, `version/*`, `release/*`, or a version-named branch like `X.Y.Z`), keep working there; don’t create another feature branch from it unless explicitly instructed.
 - **Branch naming (LumiBot convention):** prefer version-scoped branches so multiple agents can collaborate without “feature branch naming drift”. Use the repo’s existing convention (e.g., `4.4.25` or `version/X.Y.Z`).
   - Default for active release work: the shared version branch (e.g., `4.4.25`).

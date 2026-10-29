@@ -48,8 +48,12 @@ LUMIBOT_LOG_LEVEL
 IS_BACKTESTING
 ^^^^^^^^^^^^^^
 
-- Purpose: Signals backtesting mode for certain code paths.
+- Purpose: Signals backtesting mode for code that explicitly reads this value.
 - Values: ``True`` / ``False`` (string).
+- It does not choose a runner by itself: a file that only calls
+  ``Strategy.backtest()`` still backtests when this is ``False``. A local
+  ``IS_BACKTESTING`` assignment in an example is independent of this variable.
+  See :doc:`strategy_run_modes`.
 
 BACKTESTING_START / BACKTESTING_END
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -584,6 +588,45 @@ INTERACTIVE_BROKERS_IP
 - Purpose: IP address of IB Gateway/TWS.
 - Values: IP address string.
 - Default: ``127.0.0.1``.
+
+IBKR_BACKTEST_CLIENT_ID
+^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Dedicated API client id used by ``InteractiveBrokersTWSBacktesting``
+  when downloading historical bars from IB Gateway/TWS. Kept high so it never
+  collides with the client ids used by live strategies.
+- Values: Integer.
+- Default: ``77``.
+
+IBKR_BACKTEST_WHAT_TO_SHOW
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: IB ``whatToShow`` value for historical backtest downloads.
+- Values: ``TRADES``, ``MIDPOINT``, ``BID``, ``ASK``, etc.
+- Default: ``TRADES``.
+
+IBKR_BACKTEST_USE_RTH
+^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Restrict historical backtest bars to regular trading hours.
+- Values: ``1`` / ``true`` (RTH only) or ``0`` / ``false`` (include extended hours).
+- Default: ``1``.
+
+IBKR_BACKTEST_TIMEOUT
+^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Seconds to wait for a single IB historical-data response before
+  cancelling the request and raising.
+- Values: Number of seconds.
+- Default: ``120``.
+
+IBKR_BACKTEST_MAX_REQUESTS_PER_10MIN
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+- Purpose: Client-side historical-data pacing budget. IB's hard limit is 60
+  requests per rolling 10 minutes; the default leaves headroom.
+- Values: Integer.
+- Default: ``55``.
 
 IB_SUBACCOUNT
 ^^^^^^^^^^^^^

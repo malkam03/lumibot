@@ -277,6 +277,7 @@ def main(argv=None):
         or not math.isfinite(args.max_notional) or not 0 < args.max_notional <= 1000
     ):
         parser.error("Require nonzero dedicated client ID, valid port, timeout <=60s and notional <=1000.")
+    previous_log_disable = logging.root.manager.disable
     logging.disable(logging.CRITICAL)  # IB callbacks can otherwise log unmasked account identifiers.
     app = None
     try:
@@ -296,6 +297,7 @@ def main(argv=None):
         if app is not None:
             app.disconnect()
             app._thread.join(timeout=args.timeout)
+        logging.disable(previous_log_disable)
 
 
 if __name__ == "__main__":

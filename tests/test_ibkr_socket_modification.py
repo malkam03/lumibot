@@ -262,6 +262,50 @@ def test_missing_account_and_asset_mismatch_fail_closed(socket_order):
     app.placeOrder.assert_not_called()
 
 
+def test_local_foreign_client_metadata_rejected_before_snapshot(socket_order):
+    app, broker, order, _ = socket_order
+    order.broker_client_id = 18
+    with pytest.raises(ValueError, match="foreign"):
+        broker.modify_order(order, stop_price=92)
+    app.get_open_orders.assert_not_called()
+    app.placeOrder.assert_not_called()
+
+
+@pytest.mark.parametrize("metadata,value", [
+    ("broker_perm_id", 999), ("broker_account", "other-offline-account"),
+])
+def test_conflicting_local_permanent_identity_cannot_modify(socket_order, metadata, value):
+    app, broker, order, _ = socket_order
+    setattr(order, metadata, value)
+    with pytest.raises(ValueError, match="identity/account"):
+        broker.modify_order(order, stop_price=92)
+    app.placeOrder.assert_not_called()
+
+
+def test_foreign_status_does_not_finish_own_modification(socket_order):
+    app, broker, order, _ = socket_order
+
+    def send(_, contract, updated):
+        app.orderStatus(42, "Filled", 1, 0, 100, 1, 41, 100, 18, "", 0)
+        acknowledge(app, updated)
+
+    app.placeOrder.side_effect = send
+    assert broker.modify_order(order, stop_price=92) is order
+
+
+def test_duplicate_id_rejection_never_uses_submission_retry(socket_order):
+    app, broker, order, _ = socket_order
+    app.reqIds = Mock(side_effect=AssertionError("Modification must not allocate a new ID"))
+    app.placeOrder.side_effect = lambda *_: app.error(42, 103, "offline duplicate ID")
+    with pytest.raises(IBOrderModificationRejected) as caught:
+        broker.modify_order(order, stop_price=92)
+    assert caught.value.error_code == 103
+    assert app._pending_submissions == {}
+    assert app._rejected_order_ids == set()
+    app.placeOrder.assert_called_once()
+    app.reqIds.assert_not_called()
+
+
 def test_option_identity_includes_expiry_strike_and_right(socket_order):
     import datetime
 

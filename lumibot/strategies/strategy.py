@@ -2894,6 +2894,9 @@ class Strategy(_Strategy):
         data_source = getattr(getattr(self, "broker", None), "data_source", None)
         if data_source is None:
             return False
+        # Explicit opt-in for sources whose class names do not match the substrings below.
+        if getattr(data_source, "SUPPORTS_DAILY_LAST_PRICE_OPTIMIZATION", False) is True:
+            return True
         source_name = type(data_source).__name__.lower()
         is_routed_backtesting = (
             "routed" in source_name

@@ -39,6 +39,10 @@ interval:
      - :doc:`IBKR REST <backtesting.ibkr>`
      - Provider-supported intervals
      - Client Portal and Data Downloader access
+   * - Stocks and ETFs from your own IB Gateway
+     - :doc:`IBKR Gateway / TWS <backtesting.interactive_brokers_tws>`
+     - Minute and daily
+     - A running IB Gateway or TWS with the socket API enabled
    * - Options with your own Alpaca account
      - :doc:`Alpaca <backtesting.alpaca>`
      - Minute and daily
@@ -101,6 +105,7 @@ When you run a backtest, several important files are generated, each prefixed by
    backtesting.databento
    backtesting.thetadata
    backtesting.ibkr
+   backtesting.interactive_brokers_tws
    backtesting.alpaca
    backtesting.tearsheet_html
    backtesting.trades_files

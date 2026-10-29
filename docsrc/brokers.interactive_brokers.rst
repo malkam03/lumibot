@@ -68,6 +68,11 @@ To access real-time market data, you need to subscribe to the appropriate market
 
 **Note:** Market data subscriptions may incur additional fees. Review the costs associated with each package before subscribing.
 
+Live TWS price snapshots prefer the latest trade (LAST) when it is available,
+regardless of whether the previous-close tick arrives before or after it. When
+``should_use_last_close`` is enabled, the previous close is used only if the
+snapshot contains no LAST tick.
+
 Two-Factor Authentication (2FA)
 -------------------------------
 

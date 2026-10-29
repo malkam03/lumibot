@@ -24,6 +24,8 @@ class OfflinePaper(probe.PaperProbeApp):
         self.managed_accounts = ["DU123456"]
         self.ib_broker = SimpleNamespace(on_status_event=Mock())
         self.nextValidOrderId = 50
+        self.ready = Event()
+        self.reqIds = lambda _: self.nextValidId(50)
         self.native = {}
         self.sent = []
         self.holding = 0
