@@ -4,10 +4,12 @@ import os
 import random
 import time
 from collections import deque
+from copy import deepcopy
+from dataclasses import dataclass, field
 from decimal import Decimal
 from functools import reduce
 from sys import exit
-from threading import Thread
+from threading import Event, Lock, RLock, Thread, current_thread
 from typing import Union
 
 from dateutil import tz
@@ -50,6 +52,34 @@ ORDERTYPE_MAPPING = dict(
     stop_limit="STP LMT",
     trailing_stop="TRAIL",
 )
+
+
+class IBOrderModificationRejected(RuntimeError):
+    """IBKR explicitly rejected a same-ID modification."""
+
+    def __init__(self, order_id, error_code):
+        self.order_id = order_id
+        self.error_code = error_code
+        super().__init__(f"IBKR rejected modification of order {order_id} (code {error_code}).")
+
+
+class IBOrderModificationUnknown(TimeoutError):
+    """The modification may have reached IBKR; reconcile before taking action."""
+
+    def __init__(self, order_id):
+        self.order_id = order_id
+        super().__init__(
+            f"IBKR modification outcome unknown for order {order_id}; "
+            "do not retry or replace the order. Reconcile broker orders and executions."
+        )
+
+
+@dataclass
+class _IBOrderModification:
+    expected: Order
+    event: Event = field(default_factory=Event)
+    outcome: str = "pending"
+    error_code: int | None = None
 
 
 class InteractiveBrokers(Broker):
@@ -391,12 +421,32 @@ class InteractiveBrokers(Broker):
 
     def _modify_order(self, order: OrderLum, limit_price: Union[float, None] = None,
                       stop_price: Union[float, None] = None):
+        """Modify active LMT/STP/STP LMT prices, returning the order only after acknowledgement.
+
+        Rejection raises IBOrderModificationRejected; uncertain delivery/confirmation
+        raises IBOrderModificationUnknown. Neither exception changes local prices.
         """
-        Modify an order at the broker. Nothing will be done for orders that are already cancelled or filled. You are
-        only allowed to change the limit price and/or stop price. If you want to change the quantity,
-        you must cancel the order and submit a new one.
-        """
-        raise NotImplementedError("InteractiveBroker modify order is not implemented.")
+        if not order.is_active() or order.is_filled() or order.is_canceled():
+            raise ValueError("Cannot modify an inactive IBKR order.")
+        if type(order.identifier) is not int or order.identifier < 0:
+            raise ValueError("An existing integer IBKR order identifier is required.")
+        if limit_price is None and stop_price is None:
+            raise ValueError("At least one price is required.")
+        for price in (limit_price, stop_price):
+            if price is not None and (
+                isinstance(price, bool) or not math.isfinite(price) or price <= 0
+            ):
+                raise ValueError("IBKR modification prices must be finite and positive.")
+
+        confirmed = self.ib.modify_order_prices(order, limit_price, stop_price)
+        if limit_price is not None:
+            order.limit_price = confirmed.lmtPrice
+            if confirmed.orderType == "STP LMT":
+                order.stop_limit_price = confirmed.lmtPrice
+        if stop_price is not None:
+            order.stop_price = confirmed.auxPrice
+        order.update_raw(confirmed)
+        return order
 
     # =========Market functions=======================
     def _close_connection(self):
@@ -636,6 +686,29 @@ class InteractiveBrokers(Broker):
 class IBWrapper(EWrapper):
     """Listens and collects data from IB."""
 
+    def __init__(self):
+        super().__init__()
+        self._order_request_lock = RLock()
+        self._modification_lock = Lock()
+        self._pending_modifications = {}
+        self._uncertain_modifications = set()
+
+    def _finish_modification(self, order_id, outcome, error_code=None):
+        with self._modification_lock:
+            pending = self._pending_modifications.get(order_id)
+            if pending is not None and pending.outcome == "pending":
+                pending.outcome = outcome
+                pending.error_code = error_code
+                pending.event.set()
+
+    def connectionClosed(self):
+        with self._modification_lock:
+            for pending in self._pending_modifications.values():
+                if pending.outcome == "pending":
+                    pending.outcome = "unknown"
+                    pending.event.set()
+        super().connectionClosed()
+
     # Error handling code.
     def init_error(self):
         error_queue = queue.Queue()
@@ -654,6 +727,12 @@ class IBWrapper(EWrapper):
         return None
 
     def error(self, id, error_code, error_string):
+        # Warnings are not rejection acknowledgements. Unclassified errors remain
+        # uncertain rather than inviting a retry of an order IBKR may have changed.
+        if error_code in {104, 105, 109, 110, 135, 136, 161, 201, 329, 10147, 10148}:
+            self._finish_modification(id, "rejected", error_code)
+        elif error_code not in {399, 2109, 2137}:
+            self._finish_modification(id, "unknown", error_code)
         if not hasattr(self, "my_errors_queue"):
             self.init_error()
 
@@ -941,6 +1020,23 @@ class IBWrapper(EWrapper):
         return new_orders_queue
 
     def openOrder(self, orderId: OrderId, contract: Contract, order: Order, orderState: OrderState):
+        order.orderId = orderId
+        with self._modification_lock:
+            pending = self._pending_modifications.get(orderId)
+            if pending is not None and pending.outcome == "pending":
+                expected = pending.expected
+                fields = (
+                    "clientId", "parentId", "transmit", "orderType", "action",
+                    "totalQuantity", "lmtPrice", "auxPrice", "tif", "account",
+                )
+                if orderState.status in {"Submitted", "PreSubmitted"} and all(
+                    getattr(order, name) == getattr(expected, name) for name in fields
+                ) and all(
+                    getattr(contract, name) == getattr(expected.contract, name)
+                    for name in ("conId", "symbol", "secType", "currency")
+                ):
+                    pending.outcome = "accepted"
+                    pending.event.set()
         if not hasattr(self, "orders"):
             self.init_orders()
         openOrdertxt = (
@@ -991,6 +1087,8 @@ class IBWrapper(EWrapper):
         whyHeld,
         mktCapPrice,
     ):
+        if status in {"Filled", "Cancelled", "ApiCancelled"}:
+            self._finish_modification(orderId, "unknown")
         orderStatustxt = (
             f"orderStatus - "
             f"orderid: {orderId}, "
@@ -1319,6 +1417,10 @@ class IBClient(EClient):
         return requested_accounts
 
     def get_open_orders(self):
+        with self.wrapper._order_request_lock:
+            return self._get_open_orders()
+
+    def _get_open_orders(self):
         orders_storage = self.wrapper.init_orders()
 
         # Call the orders data.
@@ -1340,6 +1442,90 @@ class IBClient(EClient):
             requested_orders = [requested_orders]
 
         return requested_orders
+
+    def modify_order_prices(self, lumi_order, limit_price=None, stop_price=None):
+        """Send once using the broker-native order; only a matching openOrder confirms it."""
+        order_id = lumi_order.identifier
+        wrapper = self.wrapper
+        if current_thread() is getattr(self, "_thread", None):
+            raise RuntimeError("IBKR modification cannot block the socket callback thread.")
+        with wrapper._order_request_lock:
+            if not self.isConnected():
+                raise ConnectionError("IBKR is disconnected; modification was not sent.")
+            if order_id in wrapper._uncertain_modifications:
+                raise IBOrderModificationUnknown(order_id)
+            orders = self.get_open_orders()
+            if orders is None:
+                raise ConnectionError("IBKR open-order snapshot unavailable; modification was not sent.")
+            matches = [native for native in orders if native.orderId == order_id]
+            if len(matches) != 1:
+                raise ValueError("IBKR order is absent or ambiguous in the open-order snapshot.")
+            original = matches[0]
+            if not original.account or original.clientId != self.client_id or (
+                self.subaccount is not None and original.account != self.subaccount
+            ):
+                raise ValueError("Cannot modify an IBKR order owned by another client/account.")
+            if (
+                original.contract.symbol != normalize_symbol_for_broker(
+                    lumi_order.asset.symbol, broker_name="ibkr", asset_type=lumi_order.asset.asset_type
+                )
+                or original.contract.secType != TYPE_MAP[lumi_order.asset.asset_type]
+                or (
+                    lumi_order.quote is not None
+                    and original.contract.currency != lumi_order.quote.symbol
+                )
+                or original.action != self.get_safe_action(lumi_order.side)
+                or original.totalQuantity != lumi_order.quantity
+            ):
+                raise ValueError("IBKR native order does not match the local order identity.")
+            if lumi_order.asset.asset_type in {"option", "future"} and (
+                original.contract.lastTradeDateOrContractMonth
+                != lumi_order.asset.expiration.strftime("%Y%m%d")
+            ):
+                raise ValueError("IBKR contract expiration does not match the local order.")
+            if lumi_order.asset.asset_type == "option" and (
+                original.contract.strike != lumi_order.asset.strike
+                or original.contract.right != lumi_order.asset.right[0]
+            ):
+                raise ValueError("IBKR option contract does not match the local order.")
+            if original.orderState.status not in {"Submitted", "PreSubmitted"}:
+                raise ValueError("Cannot modify an inactive or pending IBKR order.")
+            if original.orderType not in {"LMT", "STP", "STP LMT"}:
+                raise ValueError("IBKR price modification supports only LMT, STP and STP LMT.")
+            if limit_price is not None and original.orderType == "STP":
+                raise ValueError("A stop order has no limit price to modify.")
+            if stop_price is not None and original.orderType == "LMT":
+                raise ValueError("A limit order has no stop price to modify.")
+
+            native = deepcopy(original)
+            if limit_price is not None:
+                native.lmtPrice = float(limit_price)
+            if stop_price is not None:
+                native.auxPrice = float(stop_price)
+            if native.lmtPrice == original.lmtPrice and native.auxPrice == original.auxPrice:
+                return native
+            pending = _IBOrderModification(native)
+            with wrapper._modification_lock:
+                wrapper._pending_modifications[order_id] = pending
+            try:
+                try:
+                    self.placeOrder(order_id, deepcopy(original.contract), native)
+                except Exception as exc:
+                    # A send failure cannot prove that no bytes reached TWS.
+                    wrapper._uncertain_modifications.add(order_id)
+                    raise IBOrderModificationUnknown(order_id) from exc
+                pending.event.wait(self.max_wait_time)
+                with wrapper._modification_lock:
+                    outcome, code = pending.outcome, pending.error_code
+                if outcome == "rejected":
+                    raise IBOrderModificationRejected(order_id, code)
+                if outcome != "accepted":
+                    wrapper._uncertain_modifications.add(order_id)
+                    raise IBOrderModificationUnknown(order_id)
+                return native
+            finally:
+                with wrapper._modification_lock:
+                    del wrapper._pending_modifications[order_id]
 
     def cancel_order(self, order):
         order_id = order.identifier
