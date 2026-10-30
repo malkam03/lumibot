@@ -63,6 +63,7 @@ LUMIBOT_DISABLE_DOTENV=1 LUMIBOT_DISABLE_DOTENV_LOCAL=1 LUMIBOT_LOG_LEVEL=ERROR
 ## Implemented Optimizations
 
 - Added `lumibot._lazy_imports.LazyModule` for module-like lazy imports that still pass `inspect.ismodule`.
+- Made loaded `LazyModule.__dict__` expose the wrapped module namespace so pytest 9.2's monkeypatch teardown can restore existing proxied attributes without deleting them from shared modules.
 - Added `lumibot._lazy_imports.lazy_class` for class-like lazy imports with `isinstance`/`issubclass` support.
 - Added `lumibot._lazy_imports.lazy_typing` so public `typing.get_type_hints()` keeps resolving stringified annotations without importing `typing` on startup.
 - Added `LazyPytzTimezone` for default timezone class attributes that should not force constants/pytz during package import.
