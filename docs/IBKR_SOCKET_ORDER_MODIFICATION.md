@@ -110,7 +110,8 @@ python scripts/ibkr_paper_modification_probe.py \
 ```
 
 The script requires exactly one managed paper account matching
-`DU[A-Z]?\d+`; it does not infer paper identity from a port. It
+`DU[A-Z]?\d+`; it ignores blank comma-delimited callback entries, but rejects
+non-string identities. It does not infer paper identity from a port. It
 excludes symbols with any visible position or open order, rechecks exposure
 before sending, requires fresh real-time bid/ask,
 caps the order at one share and $1,000 notional, and refuses closed sessions or

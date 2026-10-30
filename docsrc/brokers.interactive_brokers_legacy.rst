@@ -105,6 +105,8 @@ The opt-in socket paper-order probe separately verifies one managed account
 whose ID matches ``DU[A-Z]?\d+``.
 It does not infer paper status from the socket port and rejects multiple,
 non-``DU`` or malformed managed-account identities.
+Blank comma-delimited callback entries are ignored; non-string identities
+remain invalid.
 
 Once installed, navigate in Trader Workstation to ``File -> Global Configuration -> API -> Settings`` The key settings required to trade using Lumibot are:
 

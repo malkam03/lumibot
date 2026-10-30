@@ -27,7 +27,11 @@ from lumibot.tools.symbol_normalization import normalize_symbol_for_internal, no
 
 def require_paper_account(accounts):
     """Fail closed on mixed, missing, live or multiple managed accounts."""
-    accounts = [account.strip() if isinstance(account, str) else "" for account in accounts]
+    accounts = [
+        account.strip() if isinstance(account, str) else ""
+        for account in accounts
+        if not isinstance(account, str) or account.strip()
+    ]
     if len(accounts) != 1 or re.fullmatch(r"DU[A-Z]?\d+", accounts[0]) is None:
         raise RuntimeError("Probe requires exactly one DU-prefixed IBKR paper account.")
     return accounts[0]

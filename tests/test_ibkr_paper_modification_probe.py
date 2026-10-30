@@ -91,6 +91,9 @@ def test_default_cli_never_constructs_or_connects_probe(monkeypatch, capsys):
     ["DUa123456"],
     ["DU123456A"],
     [None],
+    [""],
+    [" "],
+    ["DU123456", None],
 ])
 def test_nonexclusive_paper_identity_fails_closed(accounts):
     with pytest.raises(RuntimeError):
@@ -101,6 +104,17 @@ def test_nonexclusive_paper_identity_fails_closed(accounts):
 def test_paper_identity_accepts_documented_managed_account_formats(account):
     expected = account.strip()
     assert probe.require_paper_account([account]) == expected
+
+
+@pytest.mark.parametrize("accounts,expected", [
+    (["DUA123456", ""], "DUA123456"),
+    (["DU123456", " "], "DU123456"),
+])
+def test_paper_identity_ignores_blank_callback_entries(accounts, expected):
+    """A trailing callback comma is not a second managed account."""
+    app = SimpleNamespace(accounts_ready=Mock())
+    probe.PaperProbeApp.managedAccounts(app, ",".join(accounts))
+    assert probe.require_paper_account(app.managed_accounts) == expected
 
 
 def test_symbol_selection_avoids_any_existing_exposure_or_order():
