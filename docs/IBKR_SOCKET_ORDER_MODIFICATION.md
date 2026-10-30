@@ -109,9 +109,11 @@ python scripts/ibkr_paper_modification_probe.py \
   --port <configured-paper-port> --client-id <unused-client-id>
 ```
 
-The script requires exactly one managed `DU` paper account; it does not infer
-paper identity from a port. It excludes symbols with any visible position or
-open order, rechecks exposure before sending, requires fresh real-time bid/ask,
+The script requires exactly one managed paper account matching
+`DU[A-Z]?\d+`; it ignores blank comma-delimited callback entries, but rejects
+non-string identities. It does not infer paper identity from a port. It
+excludes symbols with any visible position or open order, rechecks exposure
+before sending, requires fresh real-time bid/ask,
 caps the order at one share and $1,000 notional, and refuses closed sessions or
 the final 15 minutes (including early closes). Other sessions must not trade
 the selected symbol during the probe; the API cannot atomically reserve it.

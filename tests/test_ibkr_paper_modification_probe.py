@@ -80,14 +80,41 @@ def test_default_cli_never_constructs_or_connects_probe(monkeypatch, capsys):
     assert "NO ACTION" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize("accounts", [[], ["U123456"], ["DU123456", "U654321"], ["DU1", "DU2"], ["DU"], ["DUabc"]])
+@pytest.mark.parametrize("accounts", [
+    [],
+    ["U123456"],
+    ["DU123456", "DUA654321"],
+    ["DU1", "DU2"],
+    ["DU"],
+    ["DUabc"],
+    ["DUAB123456"],
+    ["DUa123456"],
+    ["DU123456A"],
+    [None],
+    [""],
+    [" "],
+    ["DU123456", None],
+])
 def test_nonexclusive_paper_identity_fails_closed(accounts):
     with pytest.raises(RuntimeError):
         probe.require_paper_account(accounts)
 
 
-def test_paper_identity_is_verified_not_inferred_from_port():
-    assert probe.require_paper_account(["DU123456"]) == "DU123456"
+@pytest.mark.parametrize("account", ["DU123456", "DUA123456", "DUZ654321", " DUA123456 "])
+def test_paper_identity_accepts_documented_managed_account_formats(account):
+    expected = account.strip()
+    assert probe.require_paper_account([account]) == expected
+
+
+@pytest.mark.parametrize("accounts,expected", [
+    (["DUA123456", ""], "DUA123456"),
+    (["DU123456", " "], "DU123456"),
+])
+def test_paper_identity_ignores_blank_callback_entries(accounts, expected):
+    """A trailing callback comma is not a second managed account."""
+    app = SimpleNamespace(accounts_ready=Mock())
+    probe.PaperProbeApp.managedAccounts(app, ",".join(accounts))
+    assert probe.require_paper_account(app.managed_accounts) == expected
 
 
 def test_symbol_selection_avoids_any_existing_exposure_or_order():
