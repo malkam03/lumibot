@@ -101,6 +101,11 @@ then cancel an unfilled bracket parent and confirm attached children cancel.
 Before finishing, reconcile the test symbol to a flat position and no open
 test orders. Do not run this checklist against a live account.
 
+The opt-in socket paper-order probe separately verifies one managed account
+whose ID matches ``DU[A-Z]?\d+``.
+It does not infer paper status from the socket port and rejects multiple,
+non-``DU`` or malformed managed-account identities.
+
 Once installed, navigate in Trader Workstation to ``File -> Global Configuration -> API -> Settings`` The key settings required to trade using Lumibot are:
 
 #. Enable ActiveX and Socket Clients

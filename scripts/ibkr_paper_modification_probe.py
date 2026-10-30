@@ -9,6 +9,7 @@ import datetime as dt
 import logging
 import math
 import queue
+import re
 import sys
 import time
 import uuid
@@ -26,8 +27,8 @@ from lumibot.tools.symbol_normalization import normalize_symbol_for_internal, no
 
 def require_paper_account(accounts):
     """Fail closed on mixed, missing, live or multiple managed accounts."""
-    accounts = [account.strip() for account in accounts if account.strip()]
-    if len(accounts) != 1 or not accounts[0].startswith("DU") or not accounts[0][2:].isdigit():
+    accounts = [account.strip() if isinstance(account, str) else "" for account in accounts]
+    if len(accounts) != 1 or re.fullmatch(r"DU[A-Z]?\d+", accounts[0]) is None:
         raise RuntimeError("Probe requires exactly one DU-prefixed IBKR paper account.")
     return accounts[0]
 
