@@ -153,6 +153,7 @@ class TestLoggerConfiguration:
         import lumibot.tools.lumibot_logger as logger_module
 
         root_logger = logging.getLogger("lumibot")
+        registered_logger = logger_module.get_logger("tests.test_set_log_level_cleanup")
         original_level = root_logger.level
         original_logger_levels = {
             logger: logger.level for logger in logger_module._logger_registry.values()
@@ -177,6 +178,8 @@ class TestLoggerConfiguration:
                 for handler, level in original_handler_levels.items():
                     if handler in root_logger.handlers:
                         handler.setLevel(level)
+
+        assert registered_logger.level == original_logger_levels[registered_logger]
     
     def test_invalid_log_level(self):
         """Test that invalid log level raises ValueError."""
