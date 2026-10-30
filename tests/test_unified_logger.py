@@ -24,7 +24,6 @@ from lumibot.tools.lumibot_logger import (
     get_strategy_logger,
     CSVErrorHandler,
     LumibotFormatter,
-    set_log_level
 )
 
 class TestBasicLogging:
@@ -165,10 +164,10 @@ class TestLoggerConfiguration:
         # Clear any environment variables that might interfere with log level setting
         with patch.dict(os.environ, {'BACKTESTING_QUIET_LOGS': '', 'LUMIBOT_LOG_LEVEL': ''}, clear=False):
             try:
-                set_log_level('DEBUG')
+                logger_module.set_log_level('DEBUG')
                 assert root_logger.level == logging.DEBUG
 
-                set_log_level('ERROR')
+                logger_module.set_log_level('ERROR')
                 assert root_logger.level == logging.ERROR
             finally:
                 # The logger registry and handlers are shared across test modules in CI shards.
@@ -181,8 +180,10 @@ class TestLoggerConfiguration:
     
     def test_invalid_log_level(self):
         """Test that invalid log level raises ValueError."""
+        import lumibot.tools.lumibot_logger as logger_module
+
         with pytest.raises(ValueError):
-            set_log_level('INVALID')
+            logger_module.set_log_level('INVALID')
 
 class TestLoggerFormatter:
     """Test custom formatter functionality."""
