@@ -1245,6 +1245,31 @@ def test_lazy_module_patch_teardown_restores_existing_attributes():
         assert proxy.get is original
 
 
+def test_lazy_module_pytest_monkeypatch_undo_restores_proxied_attribute(monkeypatch):
+    # pytest 9.2 inspects __dict__ when saving an attribute's prior value. The
+    # proxy must expose the wrapped module namespace so undo does not delete it.
+    import types
+
+    from lumibot._lazy_imports import LazyModule
+
+    module_name = "_lumibot_lazy_module_monkeypatch_test"
+    target = types.ModuleType(module_name)
+    original = object()
+    target.value = original
+    monkeypatch.setitem(sys.modules, module_name, target)
+
+    proxy = LazyModule(module_name)
+    monkeypatch.setattr(proxy, "value", object())
+    monkeypatch.setattr(proxy, "temporary", object(), raising=False)
+    assert proxy.__dict__ is target.__dict__
+    assert target.value is not original
+
+    monkeypatch.undo()
+
+    assert target.value is original
+    assert not hasattr(target, "temporary")
+
+
 def test_lazy_agent_builtin_module_supports_string_patches(monkeypatch):
     import lumibot.components as components
     import lumibot.components.agents as agents

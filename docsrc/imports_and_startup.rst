@@ -47,6 +47,11 @@ Lazy exports change import timing, not trading behavior:
   feature is accessed.
 - The failure should be explicit. Lazy loading must not silently skip broker,
   data-source, order, fill, or accounting behavior.
+- Once loaded, a ``LazyModule`` proxy exposes the wrapped module's namespace
+  through ``__dict__`` as well as forwarding attribute reads and writes. This
+  preserves standard module introspection and lets tools such as pytest restore
+  patched attributes instead of mistaking existing proxied attributes for new
+  ones.
 
 This means ``import lumibot`` may succeed even if an optional package needed by
 a specific broker is missing. The broker import should still fail when the
