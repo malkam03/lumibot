@@ -1104,6 +1104,10 @@ class StrategyExecutor(Thread):
                 continue
             if order.is_filled() or order.is_canceled():
                 continue
+            if getattr(order, "modification_requires_reconciliation", False):
+                # This latch is public/serialized: a restart or later final-hold
+                # pass must not turn an uncertain modification into a replacement.
+                continue
             if str(order.status).lower() in {"cancelling", "pending_cancel", "pending_replace"}:
                 # Keep the run alive for broker confirmation without repeatedly
                 # canceling/repricing an order whose mutation is already pending.
@@ -1208,7 +1212,14 @@ class StrategyExecutor(Thread):
                             self.broker.modify_order(order, limit_price=float(target_price))
                             order.limit_price = float(target_price)
                             continue
-                    except Exception:
+                    except Exception as exc:
+                        if getattr(exc, "requires_reconciliation", False):
+                            order.modification_requires_reconciliation = True
+                            self.strategy.logger.error(
+                                f"SMART_LIMIT modification outcome unknown for {order.identifier}; "
+                                "reconciliation required; cancellation and replacement blocked."
+                            )
+                            continue
                         should_replace = True
 
                 if should_replace:
@@ -1258,14 +1269,22 @@ class StrategyExecutor(Thread):
             if order.limit_price is not None and abs(order.limit_price - target_price) < 1e-9:
                 continue
 
-            order.limit_price = target_price
             try:
                 self.broker.modify_order(order, limit_price=target_price)
-            except Exception:
+                order.limit_price = target_price
+            except Exception as exc:
+                if getattr(exc, "requires_reconciliation", False):
+                    order.modification_requires_reconciliation = True
+                    self.strategy.logger.error(
+                        f"SMART_LIMIT modification outcome unknown for {order.identifier}; "
+                        "reconciliation required; cancellation and replacement blocked."
+                    )
+                    continue
                 try:
                     self.broker.cancel_order(order)
                     original_type = order.order_type
                     order.order_type = Order.OrderType.LIMIT
+                    order.limit_price = target_price
                     self.broker.submit_order(order)
                     order.order_type = original_type
                 except Exception as exc:

@@ -16,6 +16,18 @@ Overview
 - Cancels after the final hold window if unfilled.
 - If bid/ask is missing, SMART_LIMIT downgrades to a market order and emits a warning.
 
+Uncertain live modifications
+---------------------------
+
+For IBKR socket orders, a modification timeout or other unknown broker outcome
+does **not** trigger cancellation or replacement. The executor retains the last
+confirmed local price, logs an error and sets
+``order.modification_requires_reconciliation = True``. This flag survives order
+serialization and blocks subsequent repricing and final-hold cancellation.
+Reconcile broker orders, executions and positions before any deliberate recovery;
+do not clear the flag merely because the connection was restored. A run-once
+drain with unresolved work fails visibly at its bounded timeout.
+
 Presets (Option Alpha parity)
 -----------------------------
 
