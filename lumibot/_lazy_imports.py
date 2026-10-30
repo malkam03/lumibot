@@ -21,6 +21,13 @@ class LazyModule(ModuleType):
             super().__setattr__("_module", module)
         return module
 
+    def __getattribute__(self, name):
+        if name == "__dict__":
+            module = ModuleType.__getattribute__(self, "_module")
+            if module is not None:
+                return module.__dict__
+        return ModuleType.__getattribute__(self, name)
+
     def __getattr__(self, name):
         return getattr(self._load(), name)
 
