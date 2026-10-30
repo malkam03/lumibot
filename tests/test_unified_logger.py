@@ -24,7 +24,6 @@ from lumibot.tools.lumibot_logger import (
     get_strategy_logger,
     CSVErrorHandler,
     LumibotFormatter,
-    set_log_level
 )
 
 class TestBasicLogging:
@@ -150,25 +149,44 @@ class TestLoggerConfiguration:
         """Test setting global log level."""
         import os
         from unittest.mock import patch
-        
-        original_level = logging.getLogger("lumibot").level
-        
+
+        import lumibot.tools.lumibot_logger as logger_module
+
+        root_logger = logging.getLogger("lumibot")
+        registered_logger = logger_module.get_logger("tests.test_set_log_level_cleanup")
+        original_level = root_logger.level
+        original_logger_levels = {
+            logger: logger.level for logger in logger_module._logger_registry.values()
+        }
+        original_handler_levels = {
+            handler: handler.level for handler in root_logger.handlers
+        }
+
         # Clear any environment variables that might interfere with log level setting
         with patch.dict(os.environ, {'BACKTESTING_QUIET_LOGS': '', 'LUMIBOT_LOG_LEVEL': ''}, clear=False):
             try:
-                set_log_level('DEBUG')
-                assert logging.getLogger("lumibot").level == logging.DEBUG
-                
-                set_log_level('ERROR')
-                assert logging.getLogger("lumibot").level == logging.ERROR
+                logger_module.set_log_level('DEBUG')
+                assert root_logger.level == logging.DEBUG
+
+                logger_module.set_log_level('ERROR')
+                assert root_logger.level == logging.ERROR
             finally:
-                # Restore original level
-                logging.getLogger("lumibot").setLevel(original_level)
+                # The logger registry and handlers are shared across test modules in CI shards.
+                root_logger.setLevel(original_level)
+                for logger, level in original_logger_levels.items():
+                    logger.setLevel(level)
+                for handler, level in original_handler_levels.items():
+                    if handler in root_logger.handlers:
+                        handler.setLevel(level)
+
+        assert registered_logger.level == original_logger_levels[registered_logger]
     
     def test_invalid_log_level(self):
         """Test that invalid log level raises ValueError."""
+        import lumibot.tools.lumibot_logger as logger_module
+
         with pytest.raises(ValueError):
-            set_log_level('INVALID')
+            logger_module.set_log_level('INVALID')
 
 class TestLoggerFormatter:
     """Test custom formatter functionality."""
@@ -275,19 +293,33 @@ class TestEnvironmentVariables:
     
     def test_backtesting_quiet_logs(self):
         """Test BACKTESTING_QUIET_LOGS environment variable during backtesting."""
-        with patch.dict(os.environ, {'BACKTESTING_QUIET_LOGS': 'true', 'IS_BACKTESTING': 'true'}):
-            # Reset handlers to pick up environment change  
-            import lumibot.tools.lumibot_logger as logger_module
-            logger_module._handlers_configured = False
-            
-            logger_module._ensure_handlers_configured()
-            
-            # Should be at ERROR level during backtesting
-            root_logger = logging.getLogger("lumibot")
-            console_handlers = [h for h in root_logger.handlers 
-                             if isinstance(h, logging.StreamHandler)]
-            assert len(console_handlers) > 0
-            assert console_handlers[0].level == logging.ERROR
+        import lumibot.tools.lumibot_logger as logger_module
+
+        root_logger = logging.getLogger("lumibot")
+        original_level = root_logger.level
+        original_propagate = root_logger.propagate
+        original_quiet_logs = logger_module._BACKTESTING_QUIET_LOGS_ENABLED
+        original_handler_levels = {
+            handler: handler.level for handler in root_logger.handlers
+        }
+        try:
+            with patch.dict(os.environ, {'BACKTESTING_QUIET_LOGS': 'true', 'IS_BACKTESTING': 'true'}):
+                # Reapplying configuration picks up environment changes without replacing shared handlers.
+                logger_module._ensure_handlers_configured()
+
+                # Should be at ERROR level during backtesting
+                console_handlers = [h for h in root_logger.handlers
+                                   if isinstance(h, logging.StreamHandler)]
+                assert len(console_handlers) > 0
+                assert console_handlers[0].level == logging.ERROR
+        finally:
+            # Keep this process-global configuration from suppressing later shard tests.
+            root_logger.setLevel(original_level)
+            root_logger.propagate = original_propagate
+            for handler, level in original_handler_levels.items():
+                if handler in root_logger.handlers:
+                    handler.setLevel(level)
+            logger_module._BACKTESTING_QUIET_LOGS_ENABLED = original_quiet_logs
 
 if __name__ == "__main__":
     pytest.main([__file__])
