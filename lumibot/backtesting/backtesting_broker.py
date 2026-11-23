@@ -835,6 +835,8 @@ class BacktestingBroker(Broker):
                     stop_limit_price=stop_limit_price,
                     quote=order.quote,
                     order_type=stop_child_type,
+                    time_in_force=order.time_in_force,
+                    good_till_date=order.good_till_date,
                 )
                 orders.append(stop_loss_order)
 
@@ -846,6 +848,8 @@ class BacktestingBroker(Broker):
                     limit_price=order.limit_price,
                     quote=order.quote,
                     order_type=Order.OrderType.LIMIT,
+                    time_in_force=order.time_in_force,
+                    good_till_date=order.good_till_date,
                 )
                 orders.append(limit_order)
 
@@ -878,6 +882,8 @@ class BacktestingBroker(Broker):
                         trail_percent=secondary_trail_percent,
                         quote=order.quote,
                         order_type=child_order_type,
+                        time_in_force=order.time_in_force,
+                        good_till_date=order.good_till_date,
                     )
                     orders.append(stop_loss_order)
 
@@ -891,6 +897,8 @@ class BacktestingBroker(Broker):
                         limit_price=order.secondary_limit_price,
                         quote=order.quote,
                         order_type=Order.OrderType.LIMIT,
+                        time_in_force=order.time_in_force,
+                        good_till_date=order.good_till_date,
                     )
                     orders.append(limit_order)
 

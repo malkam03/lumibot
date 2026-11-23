@@ -153,9 +153,27 @@ def test_matching_duration_on_explicit_children(app, asset):
     ("oto", {"secondary_stop_price": 83}),
     ("oco", {"limit_price": 117, "stop_price": 83}),
 ])
-def test_generated_day_child_of_gtc_parent_is_rejected(app, asset, order_class, prices):
+def test_generated_children_of_gtc_parent_inherit_gtc(app, asset, order_class, prices):
+    # Updated for malkam03/lumibot#17: this test used to assert that generated
+    # children kept the "day" default and that create_order rejected the order.
+    # That was the bug: Order now builds children with the parent's TIF, so a
+    # GTC advanced order converts to all-GTC TWS legs.
     order = make_order(asset, order_class=order_class, time_in_force="gtc", **prices)
-    assert all(child.time_in_force == "day" for child in order.child_orders)
+    assert all(child.time_in_force == "gtc" for child in order.child_orders)
+    legs = app.create_order(order)
+    expected_legs = len(order.child_orders) + (0 if order_class == "oco" else 1)
+    assert len(legs) == expected_legs
+    assert [leg.tif for leg in legs] == ["GTC"] * expected_legs
+
+
+@pytest.mark.parametrize("order_class,prices", [
+    ("bracket", {"secondary_limit_price": 117, "secondary_stop_price": 83}),
+    ("oto", {"secondary_stop_price": 83}),
+    ("oco", {"limit_price": 117, "stop_price": 83}),
+])
+def test_day_child_of_gtc_parent_is_rejected(app, asset, order_class, prices):
+    order = make_order(asset, order_class=order_class, time_in_force="gtc", **prices)
+    order.child_orders[0].time_in_force = "day"
     with pytest.raises(ValueError, match="time_in_force"):
         app.create_order(order)
     assert app.nextValidOrderId == 2001
