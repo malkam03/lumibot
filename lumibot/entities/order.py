@@ -337,8 +337,11 @@ class Order:
                 - 'gtd' Good until date. (IB only)
                 - 'ioc' Immediate or cancelled.
             (Default: 'day')
+            Child orders built automatically from the secondary prices of
+            Bracket and OTO orders use the parent's time_in_force.
         good_till_date : datetime.datetime
             This is the time order is valid for Good Though Date orders.
+            Auto-built Bracket and OTO child orders use the parent's value.
         take_profit_price : float
             Limit price used for bracket orders and one cancels other
             orders. (Deprecated, use 'secondary_limit_price' instead)
@@ -1006,6 +1009,8 @@ class Order:
                             limit_price=secondary_limit_price,
                             order_type=Order.OrderType.LIMIT,
                             quote=self.quote,
+                            time_in_force=self.time_in_force,
+                            good_till_date=self.good_till_date,
                         )
                     )
                 if secondary_stop_price is not None:
@@ -1021,6 +1026,8 @@ class Order:
                             trail_price=secondary_trail_price,
                             trail_percent=secondary_trail_percent,
                             quote=self.quote,
+                            time_in_force=self.time_in_force,
+                            good_till_date=self.good_till_date,
                         )
                     )
 
@@ -1059,6 +1066,8 @@ class Order:
                             limit_price=secondary_limit_price,
                             order_type=Order.OrderType.LIMIT,
                             quote=self.quote,
+                            time_in_force=self.time_in_force,
+                            good_till_date=self.good_till_date,
                         )
                     )
                 elif secondary_stop_price is not None:
@@ -1074,6 +1083,8 @@ class Order:
                             trail_price=secondary_trail_price,
                             trail_percent=secondary_trail_percent,
                             quote=self.quote,
+                            time_in_force=self.time_in_force,
+                            good_till_date=self.good_till_date,
                         )
                     )
             elif len(self.child_orders) == 1:
