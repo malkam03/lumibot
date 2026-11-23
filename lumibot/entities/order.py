@@ -337,11 +337,11 @@ class Order:
                 - 'gtd' Good until date. (IB only)
                 - 'ioc' Immediate or cancelled.
             (Default: 'day')
-            Child orders built automatically from the secondary prices of
-            Bracket and OTO orders use the parent's time_in_force.
+            Child orders built automatically for Bracket, OTO and OCO orders
+            use the parent's time_in_force.
         good_till_date : datetime.datetime
             This is the time order is valid for Good Though Date orders.
-            Auto-built Bracket and OTO child orders use the parent's value.
+            Auto-built Bracket, OTO and OCO child orders use the parent's value.
         take_profit_price : float
             Limit price used for bracket orders and one cancels other
             orders. (Deprecated, use 'secondary_limit_price' instead)
@@ -962,6 +962,8 @@ class Order:
                     limit_price=self.limit_price,
                     order_type=Order.OrderType.LIMIT,
                     quote=self.quote,
+                    time_in_force=self.time_in_force,
+                    good_till_date=self.good_till_date,
                 )
                 stop_order = Order(
                     # Stop Type will be filled in automatically for child based on the Stop Modifiers
@@ -974,6 +976,8 @@ class Order:
                     trail_price=self.trail_price,
                     trail_percent=self.trail_percent,
                     quote=self.quote,
+                    time_in_force=self.time_in_force,
+                    good_till_date=self.good_till_date,
                 )
                 # Set dependencies so that the two orders will cancel the other in BackTesting
                 limit_order.dependent_order = stop_order
